@@ -185,7 +185,9 @@ describe("GET /authorize", () => {
     // redirect_uris must always re-show the consent dialog instead.
     expect(response.status).not.toBe(302);
     const body = await response.text();
-    expect(body).toContain("Approve");
+    // Language-independent assertion: the approve control's form value is a
+    // server-side contract and survives future copy changes.
+    expect(body).toContain('value="approve"');
   });
 
   // [redesign 2] redirect_uri policy / CIMD parity: a CIMD client's

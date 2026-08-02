@@ -125,7 +125,7 @@ app.get("/authorize", async (c) => {
         reason: error instanceof Error ? error.message : String(error),
       });
       return c.text(
-        `Invalid authorization request: ${error instanceof Error ? error.message : "unknown error"}`,
+        `不正な認可リクエストです: ${error instanceof Error ? error.message : "不明なエラー"}`,
         400,
       );
     }
@@ -142,7 +142,7 @@ app.get("/authorize", async (c) => {
         client_id: oauthReqInfo.clientId,
         reason: `unsupported response_type: ${oauthReqInfo.responseType}`,
       });
-      return c.text('Invalid authorization request: response_type must be "code"', 400);
+      return c.text('不正な認可リクエストです: response_type は "code" である必要があります', 400);
     }
     if (oauthReqInfo.codeChallengeMethod !== "S256" || !oauthReqInfo.codeChallenge) {
       log("authorize_rejected", {
@@ -151,7 +151,7 @@ app.get("/authorize", async (c) => {
         code_challenge_method: oauthReqInfo.codeChallengeMethod ?? null,
       });
       return c.text(
-        "Invalid authorization request: PKCE with code_challenge_method=S256 and a code_challenge are required",
+        "不正な認可リクエストです: PKCE（code_challenge_method=S256 および code_challenge）が必須です",
         400,
       );
     }
@@ -172,13 +172,13 @@ app.get("/authorize", async (c) => {
         reason: "redirect_uri must be https, or http restricted to a loopback address",
       });
       return c.text(
-        "Invalid authorization request: redirect_uri must be https, or http restricted to a loopback address (127.0.0.1, ::1, localhost)",
+        "不正な認可リクエストです: redirect_uri は https、またはループバックアドレス（127.0.0.1, ::1, localhost）に限定した http である必要があります",
         400,
       );
     }
 
     const { clientId } = oauthReqInfo;
-    if (!clientId) return c.text("Invalid request: missing client_id", 400);
+    if (!clientId) return c.text("不正なリクエストです: client_id がありません", 400);
 
     const client = await c.env.OAUTH_PROVIDER.lookupClient(clientId);
     const registration = registrationSource(clientId);
@@ -243,7 +243,7 @@ app.get("/authorize", async (c) => {
     if (error instanceof OAuthError) return error.toResponse();
     const reason = error instanceof Error ? error.message : String(error);
     log("authorize_failed", { reason });
-    return c.text("Internal server error", 500);
+    return c.text("サーバー内部エラーが発生しました", 500);
   }
 });
 
@@ -257,7 +257,7 @@ app.post("/authorize", async (c) => {
 
     const stateToken = formData.get("state");
     if (!stateToken || typeof stateToken !== "string") {
-      return c.text("Missing state in form data", 400);
+      return c.text("フォームデータに state がありません", 400);
     }
 
     // [dialog denial] The dialog's Cancel button is a same-form submit
@@ -283,7 +283,7 @@ app.post("/authorize", async (c) => {
     // cookie/form match above only proves the pair is internally consistent,
     // not that it belongs to the flow this stateToken came from.
     const oauthReqInfo = await approveOAuthState(stateToken, c.env.OAUTH_KV, csrfToken);
-    if (!oauthReqInfo.clientId) return c.text("Invalid request", 400);
+    if (!oauthReqInfo.clientId) return c.text("不正なリクエストです", 400);
 
     // Consent has just been given: this is the first moment an approval
     // cookie may be issued, and (together with the state binding below) the
@@ -310,7 +310,7 @@ app.post("/authorize", async (c) => {
   } catch (error) {
     if (error instanceof OAuthError) return error.toResponse();
     console.error("[oauth] POST /authorize failed:", error);
-    return c.text("Internal server error", 500);
+    return c.text("サーバー内部エラーが発生しました", 500);
   }
 });
 
@@ -344,7 +344,7 @@ app.get("/callback", async (c) => {
       return respondAccessDenied(oauthReqInfo, clearSessionCookie);
     }
 
-    if (!oauthReqInfo.clientId) return c.text("Invalid OAuth request data", 400);
+    if (!oauthReqInfo.clientId) return c.text("不正な OAuth リクエストデータです", 400);
 
     const exchange = await exchangeGitHubCode({
       clientId: c.env.GITHUB_CLIENT_ID,
@@ -354,13 +354,13 @@ app.get("/callback", async (c) => {
     });
     if (!exchange.ok) {
       log("callback_upstream_failed", { reason: exchange.reason });
-      return c.text("Failed to complete GitHub sign-in", 502);
+      return c.text("GitHub サインインの完了に失敗しました", 502);
     }
 
     const identity = await fetchGitHubIdentity(exchange.accessToken);
     if (!identity) {
       log("callback_identity_failed", {});
-      return c.text("Failed to read GitHub identity", 502);
+      return c.text("GitHub アイデンティティの取得に失敗しました", 502);
     }
 
     // Authentication succeeded; authorization is a separate decision. A
@@ -419,7 +419,7 @@ app.get("/callback", async (c) => {
     if (error instanceof OAuthError) return error.toResponse();
     const reason = error instanceof Error ? error.message : String(error);
     log("callback_failed", { reason });
-    return c.text("Authorization callback failed", 502);
+    return c.text("認可コールバックに失敗しました", 502);
   }
 });
 
@@ -427,8 +427,8 @@ app.get("/callback", async (c) => {
 
 app.get("/", (c) =>
   c.text(
-    `${SERVER_NAME}\n\nMCP endpoint: POST /mcp (OAuth 2.1 bearer token required)\n` +
-      "Resource metadata: /.well-known/oauth-protected-resource\n",
+    `${SERVER_NAME}\n\nMCPエンドポイント: POST /mcp（OAuth 2.1 ベアラートークンが必要）\n` +
+      "リソースメタデータ: /.well-known/oauth-protected-resource\n",
   ),
 );
 

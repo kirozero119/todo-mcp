@@ -1,7 +1,7 @@
 /** Constants shared by the AS entry, the consent handler, and the MCP server. */
 
 export const SERVER_NAME = "todo-mcp";
-export const SERVER_DESCRIPTION = "Personal todo MCP server. Sign in with GitHub to continue.";
+export const SERVER_DESCRIPTION = "個人用 Todo MCP サーバー。続行するには GitHub でサインインしてください。";
 export const SERVER_VERSION = "0.0.1";
 
 /** The MCP endpoint path. Also the OAuthProvider apiRoute. */

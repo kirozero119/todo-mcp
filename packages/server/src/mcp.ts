@@ -29,16 +29,16 @@ export const createTodoMcpServer = () => {
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
       instructions:
-        "Personal todo server (auth skeleton). Only `whoami` exists so far; it reports the signed-in GitHub identity.",
+        "個人用 Todo サーバー（認証スケルトン）。今のところ `whoami` のみが存在し、サインイン中の GitHub アイデンティティを報告します。",
     },
   );
 
   server.registerTool(
     "whoami",
     {
-      title: "Who am I",
+      title: "サインイン中のユーザー",
       description:
-        "Returns the GitHub identity this connection is authenticated as. Use it to confirm the server sees you as the expected user.",
+        "この接続が認証されている GitHub アイデンティティを返します。サーバーが想定通りのユーザーとして認識しているかを確認するために使用してください。",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, idempotentHint: true },
     },
@@ -52,7 +52,7 @@ export const createTodoMcpServer = () => {
           content: [
             {
               type: "text" as const,
-              text: "Authenticated identity is unavailable on this request.",
+              text: "この接続に認証済みアイデンティティがありません。",
             },
           ],
           isError: true as const,

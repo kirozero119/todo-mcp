@@ -1,68 +1,66 @@
 # todo-mcp
 
-Practical Todo MCP server — Turso + GitHub OAuth + workspace switching. Built on MCP spec 2026-07-28 / SDK v2.
+実用的な Todo MCP サーバー。Turso + GitHub OAuth + ワークスペース切り替え。MCP spec 2026-07-28 / SDK v2 上に構築。
 
-Current state: **authenticated deployment skeleton**. The authorization structure is
-production-shaped; the tool surface is a single `whoami`. Turso and the real todo tools
-land in later tickets.
+現在の状態: **認証つきデプロイのスケルトン**。認可まわりの構造は本番想定で作り込んであるが、
+ツール面は `whoami` 1本のみ。Turso と本来の todo ツールは後続チケットで追加する。
 
-## Layout
+## 構成
 
 ```
-packages/server/     Cloudflare Worker: MCP server (Resource Server) + OAuth AS
-  src/index.ts       entry — Origin guard, OAuthProvider wiring
-  src/github-handler.ts  consent dialog, GitHub redirect, callback, allowlist enforcement
+packages/server/     Cloudflare Worker: MCP サーバー（Resource Server）+ OAuth AS
+  src/index.ts       エントリーポイント — Origin ガード、OAuthProvider の配線
+  src/github-handler.ts  同意ダイアログ、GitHub へのリダイレクト、コールバック、許可リスト適用
   src/mcp.ts         SDK v2 McpServer + `whoami`
-  src/allowlist.ts   pure authorization helpers (unit tested)
-  src/approval.ts    consent dialog, CSRF, OAuth state binding
-  src/redirect-uri.ts  redirect_uri policy shared by DCR registration and GET /authorize
+  src/allowlist.ts   純粋な認可ヘルパー関数（ユニットテスト済み）
+  src/approval.ts    同意ダイアログ、CSRF、OAuth state のバインディング
+  src/redirect-uri.ts  DCR登録と GET /authorize で共有する redirect_uri ポリシー
 ```
 
-npm workspaces monorepo; `packages/core` and `packages/cli` are expected later.
+npm workspaces のモノレポ構成。`packages/core` と `packages/cli` は後日追加予定。
 
-## How the auth works
+## 認可の仕組み
 
 ```
-MCP client --(OAuth 2.1, PKCE S256, CIMD or DCR)--> this Worker (Authorization Server)
-                                                        |
-                                                        +--(OAuth 2.0)--> GitHub
+MCPクライアント --(OAuth 2.1, PKCE S256, CIMD または DCR)--> このWorker（Authorization Server）
+                                                                  |
+                                                                  +--(OAuth 2.0)--> GitHub
 ```
 
-The Worker is an Authorization Server to MCP clients and an OAuth client to GitHub.
-Only tokens this Worker issued are accepted at `/mcp`; a GitHub token presented there
-gets a 401.
+この Worker は、MCP クライアントから見ると Authorization Server であり、GitHub から見ると OAuth
+クライアントでもある。`/mcp` で受け付けられるのはこの Worker 自身が発行したトークンのみで、GitHub
+のトークンをそのまま提示しても 401 になる。
 
-- GitHub OAuth scope is **empty** — identity only (`login` + numeric `id`).
-- After GitHub confirms who you are, `ALLOWED_GITHUB_USERS` decides whether an
-  authorization is completed at all. A non-listed user is redirected back to the
-  client's own redirect_uri with `error=access_denied` (RFC 6749 §4.1.2.1) and no
-  grant is ever created — not a bare 403, which the client has no standard way to
-  interpret. GitHub's own refusals (e.g. the user cancels on GitHub's consent
-  screen) are relayed back the same way.
-- Token props carry `login` and `user_id` (`github:<numeric id>`). The numeric id is used
-  because GitHub logins can be renamed and re-registered by somebody else.
+- GitHub OAuth のスコープは**空**——アイデンティティ（`login` + 数値の `id`）のみを取得する。
+- GitHub が本人確認を終えた後、その認可を実際に完了させるかどうかは `ALLOWED_GITHUB_USERS` が判断する。
+  許可リストにないユーザーは、クライアント自身の redirect_uri に `error=access_denied`
+  （RFC 6749 §4.1.2.1）付きでリダイレクトされ、グラントは一切作られない——クライアントが解釈方法を
+  持たない単なる 403 は返さない。GitHub 自身が拒否した場合（例: GitHub の同意画面でユーザーが
+  キャンセルした場合）も同じ経路で伝える。
+- トークンの props には `login` と `user_id`（`github:<numeric id>`）を含める。数値 id を使うのは、
+  GitHub のログイン名は改名され、別人に再登録され得るため。
 
-Endpoints: `/authorize`, `/token`, `/register` (DCR), `/callback`,
-`/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource[/mcp]`,
-and `/mcp` itself.
+エンドポイント: `/authorize`、`/token`、`/register`（DCR）、`/callback`、
+`/.well-known/oauth-authorization-server`、`/.well-known/oauth-protected-resource[/mcp]`、
+そして `/mcp` 自体。
 
-## Local development
+## ローカル開発
 
-Prerequisites: Node >=22.18.0 (pinned by `engines`; a locked dependency requires it),
-and a **development** GitHub OAuth App:
+前提条件: Node >=22.18.0 （`engines` で固定。ロックされた依存パッケージがこのバージョンを要求する）、
+そして**開発用**の GitHub OAuth App:
 
 - Homepage URL: `http://localhost:8788`
 - Authorization callback URL: `http://localhost:8788/callback`
 
-`packages/server/.dev.vars` is meant to be a symlink to the repo-root `.dev.vars`, but a
-fresh clone starts without it — create it once:
+`packages/server/.dev.vars` はリポジトリルートの `.dev.vars` へのシンボリックリンクを想定しているが、
+クローン直後にはまだ存在しない——一度だけ作成する:
 
 ```bash
 ln -s ../../.dev.vars packages/server/.dev.vars
 ```
 
-Put the values in `.dev.vars` at the repo root (git-ignored;
-`packages/server/.dev.vars` is a symlink to it):
+値はリポジトリルートの `.dev.vars`（git-ignore 済み。`packages/server/.dev.vars` はこれへの
+シンボリックリンク）に設定する:
 
 ```
 GITHUB_CLIENT_ID=<dev app client id>
@@ -71,22 +69,22 @@ COOKIE_ENCRYPTION_KEY=<openssl rand -base64 32>
 ALLOWED_GITHUB_USERS=<your github login>
 ```
 
-`ALLOWED_GITHUB_USERS` fails closed: unset or empty denies everyone. Entries may be a
-GitHub login (`octocat`) or, to survive a login rename followed by someone else
-registering the freed name, the immutable numeric id in `github:<numeric id>` form
-(e.g. `github:583231`, found via `https://api.github.com/users/<login>`).
+`ALLOWED_GITHUB_USERS` はフェイルクローズ設計——未設定または空なら全員拒否になる。値は GitHub の
+ログイン名（`octocat`）、またはログイン改名後に別人が空いた名前を再登録しても追跡できるよう、
+不変の数値 id を使った `github:<numeric id>` 形式（例: `github:583231`。
+`https://api.github.com/users/<login>` で確認可能）のどちらでもよい。
 
 ```bash
 npm install
-npm run dev        # wrangler dev on http://localhost:8788
+npm run dev        # wrangler dev を http://localhost:8788 で起動
 npm run typecheck
 npm test
 ```
 
-Port 8788 is fixed by `dev.port` in `packages/server/wrangler.jsonc` because the dev
-OAuth App's callback URL is registered against it.
+ポート 8788 は `packages/server/wrangler.jsonc` の `dev.port` で固定している——開発用 OAuth App の
+callback URL がこのポートに対して登録されているため。
 
-Smoke checks that need no browser:
+ブラウザ不要のスモークチェック:
 
 ```bash
 curl -s http://localhost:8788/.well-known/oauth-protected-resource
@@ -95,80 +93,78 @@ curl -si -X POST http://localhost:8788/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'      # 401 + WWW-Authenticate
 ```
 
-The `__Host-` prefixed cookies (CSRF token, consent, approved-clients) have been
-verified working in Chrome and Firefox during local development; Safari has not been
-tested.
+`__Host-` 接頭辞付きの各種 cookie（CSRF トークン、同意、approved-clients）は、ローカル開発中に
+Chrome と Firefox での動作を確認済み。Safari は未検証。
 
-## Troubleshooting
+## トラブルシューティング
 
-- **"Invalid or expired state" on `/callback`**: KV is eventually consistent, and
-  restarting the authorization flow from `/authorize` overwrites the
-  `__Host-CSRF_TOKEN` / `__Host-CONSENTED_STATE` cookies from whichever attempt is
-  still in flight. Both cases resolve by simply retrying the sign-in from
-  `/authorize` again.
+- **`/callback` での "Invalid or expired state"**: 原因は 2 つある。①KV は結果整合性のため、
+  書き込み直後の読み取りが古い値を返すことがある。②`/authorize` から認可フローをやり直すと、
+  進行中の別試行の `__Host-CSRF_TOKEN` / `__Host-CONSENTED_STATE` cookie を上書きしてしまう。
+  いずれの場合も `/authorize` からサインインをやり直せば解消する。
 
-## Deployment
+## デプロイ
 
-1. **Production GitHub OAuth App** (separate from the dev one — the callback URL differs):
+1. **本番用 GitHub OAuth App**（callback URL が異なるため、開発用とは別に用意する）:
    - Homepage URL: `https://todo-mcp.<your-subdomain>.workers.dev`
    - Authorization callback URL: `https://todo-mcp.<your-subdomain>.workers.dev/callback`
 
-2. **KV namespace** — the provider stores grants, tokens and registered clients there:
+2. **KV namespace** — provider がグラント・トークン・登録済みクライアントを保存する:
 
    ```bash
    cd packages/server
    npx wrangler kv namespace create "OAUTH_KV"
    ```
 
-   Put the returned id into `kv_namespaces[0].id` in `packages/server/wrangler.jsonc`
-   (it currently holds the placeholder `REPLACE_ME_BEFORE_DEPLOY`).
+   返ってきた id を `packages/server/wrangler.jsonc` の `kv_namespaces[0].id` に入れる
+   （現在はプレースホルダーの `REPLACE_ME_BEFORE_DEPLOY` が入っている）。
 
-3. **Secrets** — all four, none of them in `wrangler.jsonc`:
+3. **シークレット** — 4つとも `wrangler.jsonc` には書かない:
 
    ```bash
    cd packages/server
    npx wrangler secret put GITHUB_CLIENT_ID
    npx wrangler secret put GITHUB_CLIENT_SECRET
    npx wrangler secret put COOKIE_ENCRYPTION_KEY   # openssl rand -base64 32
-   npx wrangler secret put ALLOWED_GITHUB_USERS    # comma-separated logins, or github:<numeric id>
+   npx wrangler secret put ALLOWED_GITHUB_USERS    # カンマ区切りのログイン名、または github:<numeric id>
    ```
 
-   `ALLOWED_GITHUB_USERS` is a secret rather than a `vars` entry on purpose: a `vars`
-   entry of the same name would overwrite the secret on every deploy.
+   `ALLOWED_GITHUB_USERS` をあえて `vars` ではなくシークレットにしているのは、同名の `vars`
+   エントリがあるとデプロイのたびにシークレットを上書きしてしまうため。
 
-4. **Deploy**:
+4. **デプロイ**:
 
    ```bash
    npm run deploy
    ```
 
-5. **Connect** — point the MCP client at `https://todo-mcp.<your-subdomain>.workers.dev/mcp`
-   and complete the GitHub sign-in in the browser window it opens.
+5. **接続** — MCP クライアントを `https://todo-mcp.<your-subdomain>.workers.dev/mcp` に向け、
+   開いたブラウザウィンドウで GitHub サインインを完了させる。
 
-## Notes for operators
+## 運用者向けメモ
 
-- `compatibility_flags` must keep `global_fetch_strictly_public`; without it the provider
-  refuses to fetch Client ID Metadata Documents and advertises
-  `client_id_metadata_document_supported: false`, forcing every client onto DCR.
-- Both registration paths are advertised. Every authorization logs which one a client
-  used: `[oauth] {"event":"authorize","registration":"cimd"|"registered",...}`, and
-  failures log as `authorize_rejected` with the rejected redirect_uri. To force clients
-  onto DCR, set `clientIdMetadataDocumentEnabled: false` in `src/index.ts`.
-- DCR-registered `redirect_uris` must all be `https`, or `http` restricted to a loopback
-  address (`127.0.0.1`, `::1`, `localhost` — RFC 8252 §7.3); anything else is rejected at
-  registration with `invalid_redirect_uri`. The same policy is asserted again at GET
-  /authorize (`src/redirect-uri.ts`), so a CIMD client — whose `redirect_uris` come from
-  a fetched document and never pass through DCR at all — cannot bypass it either.
-- DCR client registrations expire after 90 days (`clientRegistrationTTL`), matching the
-  provider's own default. Kept comfortably longer than the 30-day refresh token TTL so a
-  still-valid refresh token never outlives its own `client:<id>` KV record.
-- Access tokens live 1 hour, refresh tokens 30 days (provider defaults). Revoke a user's
-  access by removing them from `ALLOWED_GITHUB_USERS` **and** deleting their grants —
-  the allowlist is checked at authorization time, not on every request.
-- The provider does not send an `iss` parameter on the authorization response. MCP
-  final (SEP-2468) lists this as a SHOULD for the AS, not a MUST — a known gap, not a
-  bug, and not currently blocking any client this server has been tested against.
-- The `/register` (DCR) endpoint stays enabled for now. Once at least 3 real clients
-  have connected successfully, consider disabling it (drop `clientRegistrationEndpoint`
-  in `src/index.ts`) to push everyone onto CIMD, which needs no persisted client
-  record at all.
+- `compatibility_flags` には `global_fetch_strictly_public` を必ず維持すること。これがないと
+  provider は Client ID Metadata Document の取得を拒否し、
+  `client_id_metadata_document_supported: false` を広告してしまい、全クライアントが DCR に
+  強制される。
+- 両方の登録方式（CIMD / DCR）を広告している。どちらを使ったかはすべての認可でログに残る:
+  `[oauth] {"event":"authorize","registration":"cimd"|"registered",...}`。失敗時は拒否された
+  redirect_uri とともに `authorize_rejected` としてログされる。クライアントを DCR に強制したい
+  場合は `src/index.ts` の `clientIdMetadataDocumentEnabled` を `false` にする。
+- DCR で登録する `redirect_uris` はすべて `https`、またはループバックアドレス（`127.0.0.1`、
+  `::1`、`localhost` — RFC 8252 §7.3）に限定した `http` である必要がある。それ以外は登録時に
+  `invalid_redirect_uri` で拒否される。同じポリシーは GET /authorize（`src/redirect-uri.ts`）でも
+  再度検証しているため、`redirect_uris` が取得したドキュメント由来で DCR を一切経由しない CIMD
+  クライアントもこのポリシーを回避できない。
+- DCR で登録したクライアントは 90 日で失効する（`clientRegistrationTTL`。provider 自体のデフォルト
+  値に合わせている）。30 日の refresh token TTL より十分長く保ち、まだ有効な refresh token が自身の
+  `client:<id>` の KV レコードより長生きすることがないようにしている。
+- アクセストークンの寿命は 1 時間、refresh token は 30 日（provider のデフォルト）。ユーザーの
+  アクセスを取り消すには `ALLOWED_GITHUB_USERS` から削除し、**かつ**そのユーザーのグラントを
+  削除すること——許可リストのチェックは認可時にのみ行われ、リクエストのたびには行われない。
+- provider は認可レスポンスに `iss` パラメータを送出しない。MCP final（SEP-2468）ではこれを AS
+  にとっての SHOULD としており MUST ではない——既知のギャップであり不具合ではなく、これまで
+  検証したどのクライアントに対しても現時点でブロッカーにはなっていない。
+- `/register`（DCR）エンドポイントは今のところ有効のままにしてある。実クライアントが3件以上
+  接続できたら、`/register` を無効化して（`src/index.ts` の `clientRegistrationEndpoint` を削除）
+  全員を CIMD に寄せることを検討する——CIMD はクライアントレコードの永続化が一切不要になる。

@@ -517,11 +517,11 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
   const { client, requestedRedirectUri, isCimdClient, server, stateToken, csrfToken, setCookie } =
     options;
 
-  const clientName = client?.clientName ? sanitizeText(client.clientName) : "Unknown MCP Client";
+  const clientName = client?.clientName ? sanitizeText(client.clientName) : "不明なMCPクライアント";
   const clientId = client?.clientId ? sanitizeText(client.clientId) : "";
   const redirectUri = sanitizeText(sanitizeUrl(requestedRedirectUri));
 
-  let redirectHost = "(unparsable)";
+  let redirectHost = "(解析不可)";
   try {
     redirectHost = sanitizeText(new URL(requestedRedirectUri).host);
   } catch {
@@ -538,20 +538,20 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
   }
 
   const loopbackWarning = isLoopbackRedirectUri(requestedRedirectUri)
-    ? `<p class="warn">This client will receive the authorization code on <strong>${redirectHost}</strong>,
-         a loopback address. Any program on this machine can listen on a loopback port, so approve only if
-         you started this login yourself, just now.</p>`
+    ? `<p class="warn">このクライアントは認可コードを <strong>${redirectHost}</strong>
+         （ループバックアドレス）で受け取ります。このマシン上のどのプログラムでもループバックポートを待ち受けられるため、
+         たった今あなた自身がこのログインを開始した場合のみ承認してください。</p>`
     : "";
 
   const cimdNote = cimdHost
-    ? `<p class="note">Client identity comes from a Client ID Metadata Document served by
-         <strong>${cimdHost}</strong>.</p>`
+    ? `<p class="note">クライアントの身元は <strong>${cimdHost}</strong> が配信する
+         Client ID Metadata Document（CIMD）に基づいています。</p>`
     : "";
 
   const html = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
+<html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>${clientName} | Authorization Request</title>
+<title>${clientName} | 認可リクエスト</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          max-width: 34rem; margin: 3rem auto; padding: 0 1.25rem; color: #222; line-height: 1.6; }
@@ -568,10 +568,10 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
 <body><div class="card">
   <h1>${sanitizeText(server.name)}</h1>
   ${server.description ? `<p>${sanitizeText(server.description)}</p>` : ""}
-  <p><strong>${clientName}</strong> is requesting access. If you approve, you will be sent to GitHub to sign in.</p>
+  <p><strong>${clientName}</strong> がアクセスを要求しています。承認すると GitHub のサインイン画面に移動します。</p>
   <dl>
-    <dt>Client ID</dt><dd>${clientId || "(none)"}</dd>
-    <dt>Redirect to</dt><dd>${redirectUri || "(invalid redirect_uri)"}</dd>
+    <dt>クライアントID</dt><dd>${clientId || "(なし)"}</dd>
+    <dt>リダイレクト先</dt><dd>${redirectUri || "(無効な redirect_uri)"}</dd>
   </dl>
   ${cimdNote}
   ${loopbackWarning}
@@ -579,8 +579,8 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
     <input type="hidden" name="csrf_token" value="${sanitizeText(csrfToken)}">
     <input type="hidden" name="state" value="${sanitizeText(stateToken)}">
     <div class="actions">
-      <button type="submit" name="decision" value="deny" class="cancel">Cancel</button>
-      <button type="submit" name="decision" value="approve" class="approve">Approve</button>
+      <button type="submit" name="decision" value="deny" class="cancel">キャンセル</button>
+      <button type="submit" name="decision" value="approve" class="approve">承認する</button>
     </div>
   </form>
 </div></body></html>`;
