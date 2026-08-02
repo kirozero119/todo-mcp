@@ -599,16 +599,26 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
       // of defense in depth in case a future edit introduces an unescaped
       // interpolation. `default-src 'none'` blocks everything by default;
       // `style-src 'unsafe-inline'` is required for this page's own inline
-      // `<style>` block; `form-action 'self' https://github.com` keeps the
-      // consent form's submission targets to this origin and GitHub. Chrome
-      // applies form-action to the *entire* post-submit redirect chain, not
-      // just the immediate POST target: POST /authorize (self) 302s straight
-      // to https://github.com/login/oauth/authorize, and without the GitHub
-      // origin listed here Chrome blocks that redirect after Approve is
-      // clicked (observed in a real browser against the Claude Code OAuth
-      // flow; curl and unit tests never exercise the browser-side redirect
-      // enforcement so this went undetected there).
-      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://github.com",
+      // `<style>` block.
+      //
+      // Deliberately no `form-action` directive. Chrome checks form-action
+      // against *every* hop of the post-submit redirect chain, not just the
+      // form's immediate action target: POST /authorize (self) -> 302
+      // https://github.com/login/oauth/authorize -> ... -> 302 /callback ->
+      // 302 to the MCP client's own redirect_uri, which for a loopback CLI
+      // client is an *arbitrary, per-run port* (RFC 8252) and for a CIMD
+      // client can be an arbitrary https origin entirely outside this
+      // server's control. An allowlist naming this origin plus
+      // https://github.com still gets blocked on that final hop, because the
+      // client's redirect_uri is neither. There is no fixed allowlist that
+      // covers a redirect target this server cannot predict, so no
+      // form-action directive can be correct here — this was observed
+      // breaking the Approve flow twice against a real browser (Chrome)
+      // driving the Claude Code OAuth login; curl and unit tests never
+      // exercise browser-side redirect-chain enforcement, so neither caught
+      // it. Defense here instead rests on `default-src 'none'` plus
+      // sanitizing every value interpolated into this page.
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
       "X-Content-Type-Options": "nosniff",
     },
   });
