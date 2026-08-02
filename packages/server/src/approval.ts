@@ -599,9 +599,16 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
       // of defense in depth in case a future edit introduces an unescaped
       // interpolation. `default-src 'none'` blocks everything by default;
       // `style-src 'unsafe-inline'` is required for this page's own inline
-      // `<style>` block; `form-action 'self'` keeps the consent form's only
-      // possible submission target this same origin.
-      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+      // `<style>` block; `form-action 'self' https://github.com` keeps the
+      // consent form's submission targets to this origin and GitHub. Chrome
+      // applies form-action to the *entire* post-submit redirect chain, not
+      // just the immediate POST target: POST /authorize (self) 302s straight
+      // to https://github.com/login/oauth/authorize, and without the GitHub
+      // origin listed here Chrome blocks that redirect after Approve is
+      // clicked (observed in a real browser against the Claude Code OAuth
+      // flow; curl and unit tests never exercise the browser-side redirect
+      // enforcement so this went undetected there).
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://github.com",
       "X-Content-Type-Options": "nosniff",
     },
   });
