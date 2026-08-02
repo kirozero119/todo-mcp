@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "todo-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  // nodejs_compat                : agents/mcp/server uses node:async_hooks (AsyncLocalStorage)
+  //                                to carry the auth context into tool handlers.
+  // global_fetch_strictly_public : REQUIRED for CIMD. @cloudflare/workers-oauth-provider
+  //                                refuses to fetch Client ID Metadata Documents without it
+  //                                (SSRF guard — getClient() / hasGlobalFetchStrictlyPublic()
+  //                                in dist/oauth-provider.js). Without the flag,
+  //                                `client_id_metadata_document_supported` is advertised false.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      // Created 2026-08-02 via: npx wrangler kv namespace create "OAUTH_KV"
+      // `wrangler dev` ignores this value and uses local KV simulation in .wrangler/state.
+      "id": "d03ff01c84fc41e79016858a8b2d1542"
+    }
+  ],
+
+  // Secrets (NOT declared here — see README):
+  //   GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET / COOKIE_ENCRYPTION_KEY / ALLOWED_GITHUB_USERS
+  // Local:      packages/server/.dev.vars (symlink to the repo-root .dev.vars)
+  // Production: npx wrangler secret put <NAME>
+  //
+  // ALLOWED_GITHUB_USERS is deliberately NOT under "vars": a `vars` entry of the same
+  // name would clobber the deployed secret on every `wrangler deploy`.
+
+  "dev": {
+    // The dev GitHub OAuth App's callback URL is http://localhost:8788/callback,
+    // so local dev must listen on 8788.
+    "port": 8788
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

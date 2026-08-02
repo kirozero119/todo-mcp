@@ -1,0 +1,19 @@
+{
+  "name": "todo-mcp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Practical Todo MCP server — Turso + GitHub OAuth + workspace switching",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @todo-mcp/server",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "deploy": "npm run deploy --workspace @todo-mcp/server"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

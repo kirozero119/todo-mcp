@@ -1,0 +1,27 @@
+{
+  "name": "@todo-mcp/server",
+  "version": "0.0.0",
+  "private": true,
+  "description": "todo-mcp Cloudflare Worker — MCP server (Resource Server) + self-hosted OAuth AS delegating to GitHub",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^0.8.3",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.20.1",
+    "hono": "^4.12.27",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260801.1",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.118.0"
+  }
+}
