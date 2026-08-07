@@ -1,14 +1,13 @@
 /**
- * The defaultHandler half of the two-layer AS.
+ * 二層構造の AS のうち defaultHandler 側。
  *
- *   MCP client --(OAuth 2.1 + CIMD/DCR)--> this Worker (Authorization Server)
- *                                              |
- *                                              +--(plain OAuth 2.0)--> GitHub
+ *   MCP クライアント --(OAuth 2.1 + CIMD/DCR)--> この Worker（Authorization Server）
+ *                                                    |
+ *                                                    +--(素の OAuth 2.0)--> GitHub
  *
- * OAuthProvider owns /authorize's *parsing*, /token, /register and the
- * .well-known documents. This file owns everything a human sees: the consent
- * dialog, the redirect to GitHub, and the callback that decides whether the
- * authorization is completed at all.
+ * OAuthProvider は /authorize の*パース*、/token、/register、.well-known
+ * ドキュメントを担う。このファイルは人間の目に触れる部分（同意画面、GitHub への
+ * リダイレクト、認可を完了させるか決めるコールバック）をすべて担う。
  */
 import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
@@ -41,12 +40,10 @@ import type { Env } from "./types";
 const app = new Hono<{ Bindings: Env }>();
 
 /**
- * Which registration path did this client_id come from?
+ * この client_id はどちらの登録経路から来たか。
  *
- * Mirrors the provider's own isClientMetadataUrl(): an https URL with a
- * non-root path is treated as a Client ID Metadata Document; anything else is
- * looked up in KV (dynamically registered via /register, or created through
- * OAuthHelpers.createClient).
+ * provider 自身の isClientMetadataUrl() を踏襲: 非 root パスを持つ https URL
+ * なら CIMD、それ以外は KV 登録済みクライアント。
  */
 function registrationSource(clientId: string): "cimd" | "registered" {
   try {
@@ -83,13 +80,9 @@ function redirectToGitHub(
 }
 
 /**
- * [L-13] Shared by both ways an authorization can end in denial without ever
- * creating a grant: our own allowlist rejecting the GitHub identity, and
- * GitHub itself refusing the upstream authorization (user hit "Cancel" on
- * GitHub's own consent screen, GitHub App suspended, etc.). Both report the
- * denial back to the client at its own already-validated redirect_uri per
- * RFC 6749 §4.1.2.1, with the original client `state` if any, instead of a
- * bare error status the client has no standard way to interpret.
+ * [L-13] grant を作らずに拒否で終わる2つの経路（allowlist 拒否 / GitHub 自身の
+ * 拒否）で共有する。RFC 6749 §4.1.2.1 に従い、クライアントの検証済み
+ * redirect_uri へリダイレクトで返す。詳細は docs/design-notes.md 参照。
  */
 function respondAccessDenied(
   oauthReqInfo: AuthRequest,
@@ -109,13 +102,12 @@ app.get("/authorize", async (c) => {
   try {
     let oauthReqInfo: AuthRequest;
     try {
-      // Validates client_id (KV lookup or CIMD fetch), redirect_uri against the
-      // client's registered list, and the PKCE method. Throws on any mismatch.
+      // client_id（KV 検索 or CIMD 取得）、redirect_uri（登録済みリストとの
+      // 照合）、PKCE メソッドを検証する。不一致があれば throw。
       oauthReqInfo = await c.env.OAUTH_PROVIDER.parseAuthRequest(c.req.raw);
     } catch (error) {
-      // The single most useful log line when a client cannot connect: it shows
-      // whether the failure is a redirect_uri/port mismatch (the Claude Code CIMD
-      // regression) versus an unknown client or a rejected PKCE method.
+      // クライアントが接続できないときに最も役立つログ行: redirect_uri/ポート
+      // 不一致か、未知クライアントか、PKCE メソッド拒否かを切り分けられる。
       const url = new URL(c.req.url);
       log("authorize_rejected", {
         client_id: url.searchParams.get("client_id"),
@@ -130,13 +122,9 @@ app.get("/authorize", async (c) => {
       );
     }
 
-    // [M-1/P1-1] The provider's own parseAuthRequest() does not enforce PKCE or
-    // reject the implicit flow itself: a missing code_challenge alongside
-    // code_challenge_method=S256 passes through untouched, and
-    // completeAuthorization() has no PKCE/implicit guard of its own
-    // (confirmed against dist/oauth-provider.js). MCP requires the
-    // authorization_code grant with S256 PKCE, so that is asserted here,
-    // immediately after parsing and before anything else touches this request.
+    // [M-1/P1-1] provider の parseAuthRequest() 自体は PKCE を強制しない
+    // （PKCE 素通り。経緯は docs/design-notes.md 参照）。MCP は S256 PKCE 付き
+    // authorization_code グラントを必須とするため、ここで明示的にアサートする。
     if (oauthReqInfo.responseType !== "code") {
       log("authorize_rejected", {
         client_id: oauthReqInfo.clientId,
@@ -156,14 +144,9 @@ app.get("/authorize", async (c) => {
       );
     }
 
-    // [redirect_uri policy / CIMD parity] index.ts's clientRegistrationCallback
-    // already enforces this same policy, but only at DCR registration time. A
-    // Client ID Metadata Document (CIMD) client's redirect_uris come from a
-    // document this server fetched at parseAuthRequest() time above and never
-    // pass through that callback at all, so without asserting the policy here
-    // too, a CIMD client could reach completeAuthorization() with any
-    // scheme/host in redirect_uri. Checked immediately after the PKCE assert
-    // and before anything is committed to KV.
+    // [redirect_uri policy / CIMD parity] index.ts の clientRegistrationCallback
+    // は DCR 登録時にしか効かないため、CIMD クライアントにもここで同じポリシーを
+    // 適用する。詳細は docs/design-notes.md 参照。
     if (!isAllowedRegistrationRedirectUri(oauthReqInfo.redirectUri)) {
       log("authorize_rejected", {
         client_id: oauthReqInfo.clientId,
@@ -194,15 +177,10 @@ app.get("/authorize", async (c) => {
       resource: oauthReqInfo.resource ?? null,
     });
 
-    // Already consented to *this exact* (client, redirect_uri) pair in this
-    // browser: skip the dialog but still mint a fresh one-time state and bind
-    // it to the session before leaving for GitHub.
-    //
-    // [H-1] Loopback redirect_uris are excluded from the fast path: any local
-    // process can listen on a loopback port (RFC 8252 §7.3), so a prior
-    // consent to "some program on localhost" must not silently authorize
-    // whatever now happens to be listening there — that case always gets the
-    // dialog, every time.
+    // このブラウザで既に同一の (client, redirect_uri) に同意済みなら同意画面は
+    // スキップするが、GitHub へ行く前に新しいワンタイム state だけは作り直す。
+    // [H-1] ループバック redirect_uri は高速経路から除外する。経緯は
+    // docs/design-notes.md 参照。
     const preapproved =
       (await isClientApproved(
         c.req.raw,
@@ -211,15 +189,10 @@ app.get("/authorize", async (c) => {
         c.env.COOKIE_ENCRYPTION_KEY,
       )) && !isLoopbackRedirectUri(oauthReqInfo.redirectUri);
 
-    // [M-1/P1-1 + state ownership] The validated request is committed to KV
-    // under a fresh opaque token before either branch below runs; neither
-    // ever hands the request itself back to the browser again. The
-    // preapproved fast path never renders the dialog and so never issues a
-    // CSRF cookie at all — its state is created with no CSRF pairing
-    // (csrfToken: null), rather than a token generated but handed to nobody.
-    // The dialog path generates its CSRF token *first* so createOAuthState()
-    // can commit its hash at creation time, binding this exact state to the
-    // exact session the dialog is about to be sent to.
+    // [M-1/P1-1 + state ownership] 検証済みリクエストはどちらの分岐に進む前にも
+    // 必ず KV へ新しい不透明トークンとしてコミットする。プレアプルーブ経路は
+    // CSRF ペアリングなし（null）、ダイアログ経路は CSRF トークンを先に生成
+    // してから state に束縛する。詳細は docs/design-notes.md 参照。
     const csrf = preapproved ? null : generateCSRFProtection();
     const { stateToken } = await createOAuthState(oauthReqInfo, c.env.OAUTH_KV, csrf?.token ?? null);
 
@@ -251,8 +224,7 @@ app.post("/authorize", async (c) => {
   try {
     const formData = await c.req.raw.formData();
     const { clearCookie: clearCsrfCookie } = validateCSRFToken(formData, c.req.raw);
-    // validateCSRFToken() above already asserts this is present and a string
-    // (it throws otherwise), and that it matches this browser's CSRF cookie.
+    // validateCSRFToken() が存在確認と CSRF cookie との一致を既にアサート済み。
     const csrfToken = formData.get("csrf_token") as string;
 
     const stateToken = formData.get("state");
@@ -260,34 +232,22 @@ app.post("/authorize", async (c) => {
       return c.text("フォームデータに state がありません", 400);
     }
 
-    // [dialog denial] The dialog's Cancel button is a same-form submit
-    // (name="decision" value="deny") rather than a client-side
-    // window.history.back(): the CSP here has no script-src, so any inline
-    // JS is simply dead, and history.back() alone would strand the waiting
-    // OAuth client with no callback at all. Denial never calls
-    // approveOAuthState() — the state is deleted outright via
-    // rejectOAuthState() so it can never subsequently be approved or denied
-    // again — and never issues the approved-client or session-binding
-    // cookies, nor forwards the browser to GitHub.
+    // [dialog denial] Cancel は同一フォーム送信（decision=deny）。approveOAuthState()
+    // は呼ばず rejectOAuthState() で state を即削除する。詳細は
+    // docs/design-notes.md 参照。
     if (formData.get("decision") === "deny") {
       const oauthReqInfo = await rejectOAuthState(stateToken, c.env.OAUTH_KV);
       log("authorize_user_denied", { client_id: oauthReqInfo.clientId });
       return respondAccessDenied(oauthReqInfo, clearCsrfCookie);
     }
 
-    // [M-1/P1-1 + state ownership] approveOAuthState() reads the authorization
-    // request back from KV by the opaque token alone — never from anything
-    // the client submitted in this POST — and is the only place `approved`
-    // flips true. Passing csrfToken here additionally verifies that this
-    // exact stateToken was minted alongside this exact CSRF token: the
-    // cookie/form match above only proves the pair is internally consistent,
-    // not that it belongs to the flow this stateToken came from.
+    // [M-1/P1-1 + state ownership] approveOAuthState() は不透明トークンだけで
+    // KV からリクエストを引き直す。csrfToken 照合の詳細は
+    // docs/design-notes.md 参照。
     const oauthReqInfo = await approveOAuthState(stateToken, c.env.OAUTH_KV, csrfToken);
     if (!oauthReqInfo.clientId) return c.text("不正なリクエストです", 400);
 
-    // Consent has just been given: this is the first moment an approval
-    // cookie may be issued, and (together with the state binding below) the
-    // first moment the browser may be forwarded to the third-party IdP.
+    // 同意が今まさに行われた瞬間: ここで初めて approval cookie を発行できる。
     const approvedClientCookie = await addApprovedClient(
       c.req.raw,
       oauthReqInfo.clientId,
@@ -317,24 +277,18 @@ app.post("/authorize", async (c) => {
 // ----------------------------------------------------------------- /callback
 
 app.get("/callback", async (c) => {
-  // [L-14] Everything past state validation talks to two external services
-  // (GitHub's token and user endpoints) and to the OAuth provider's own KV
-  // operations. None of those failure modes may leak a stack trace, a
-  // partially-built error message containing a secret, or an unhandled
-  // exception straight to the client — they all fold into the single
-  // catch below.
+  // [L-14] state 検証より先はすべて外部サービス（GitHub）とプロバイダの KV に
+  // 触れるため、失敗はすべてこの単一 catch に集約し、シークレットやスタック
+  // トレースを漏らさない。詳細は docs/design-notes.md 参照。
   try {
     const { oauthReqInfo, clearCookie: clearSessionCookie } = await validateOAuthState(
       c.req.raw,
       c.env.OAUTH_KV,
     );
 
-    // [GitHub-side denial] GitHub reports its own refusals (user hit Cancel
-    // on GitHub's consent screen, GitHub App suspended, etc.) as `?error=...`
-    // with no `code` at all. Before this check, that fell straight into
-    // exchangeGitHubCode()'s "missing code parameter" branch below and
-    // surfaced as a bare 502 — indistinguishable from an actual upstream
-    // outage, and not a status the client has any standard way to interpret.
+    // [GitHub-side denial] GitHub 自身の拒否は `code` なしの `?error=...` で
+    // 返ってくる。通常のアクセス拒否と同じ経路で扱う。詳細は
+    // docs/design-notes.md 参照。
     const upstreamError = c.req.query("error");
     if (upstreamError) {
       log("callback_upstream_denied", {
@@ -363,38 +317,31 @@ app.get("/callback", async (c) => {
       return c.text("GitHub アイデンティティの取得に失敗しました", 502);
     }
 
-    // Authentication succeeded; authorization is a separate decision. A
-    // non-allowlisted user never reaches completeAuthorization(), so no
-    // grant, no authorization code, and no token ever exist for them.
+    // 認証成功と認可は別の判断。allowlist 外のユーザーは completeAuthorization()
+    // に一切到達しない（grant もコードもトークンも存在しない）。
     if (!isGitHubUserAllowed(identity.login, identity.id, c.env.ALLOWED_GITHUB_USERS)) {
       log("callback_denied", {
         login: identity.login,
         user_id: githubUserId(identity.id),
         client_id: oauthReqInfo.clientId,
       });
-      // [L-13] RFC 6749 §4.1.2.1: report the denial back to the client at its
-      // already-validated redirect_uri (with the original `state`, if any)
-      // instead of a bare 403 the client has no standard way to interpret.
+      // [L-13] RFC 6749 §4.1.2.1 に従いリダイレクトで拒否を返す。
       return respondAccessDenied(oauthReqInfo, clearSessionCookie);
     }
 
-    // [P1-2/L-7] Always attach an audience. A client that omits RFC 8707
-    // `resource` would otherwise get a token whose audience is unset —
-    // usable, in principle, against any resource this AS ever issues a
-    // token for — rather than one scoped to this resource server. Existing
-    // clients that do send `resource` are never overridden.
+    // [P1-2/L-7] `resource` を省略するクライアントには裸のオリジンを補完し、
+    // audience 未設定のトークンを発行しないようにする（index.ts の
+    // resourceMatchOriginOnly と対。詳細は docs/design-notes.md 参照）。
     const resource = oauthReqInfo.resource ?? new URL(c.req.raw.url).origin;
 
-    // [scope enforcement] Computed once and used for both the grant's scope
-    // and props.scopes: mcp.ts's apiHandler checks the latter against
-    // SCOPES_SUPPORTED before any tool call is reached, so the token's
-    // enforced scope must be the same value the grant itself was issued with.
+    // [scope enforcement] grant の scope と props.scopes に一度だけ計算した
+    // 値を使い回す。強制ロジック本体は mcp.ts の hasRequiredScope()。
     const grantedScopes = resolveGrantedScopes(oauthReqInfo.scope, SCOPES_SUPPORTED);
 
     const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
       request: { ...oauthReqInfo, resource },
-      // Colon-free: the provider's opaque token format is `userId:grantId:secret`
-      // and validation splits on ':' expecting exactly 3 parts.
+      // コロンなし: provider のトークン形式は `userId:grantId:secret` で
+      // ちょうど3パーツを要求する（詳細は allowlist.ts の設計ノート参照）。
       userId: githubGrantUserId(identity.id),
       metadata: { label: identity.login },
       scope: grantedScopes,
@@ -423,7 +370,7 @@ app.get("/callback", async (c) => {
   }
 });
 
-// --------------------------------------------------------------------- misc
+// --------------------------------------------------------------------- 雑多
 
 app.get("/", (c) =>
   c.text(

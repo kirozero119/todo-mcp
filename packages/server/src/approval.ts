@@ -1,32 +1,18 @@
 /**
- * Consent dialog, CSRF protection, and OAuth state binding.
+ * 同意画面、CSRF 対策、OAuth state の束縛。
  *
- * Adapted from the Cloudflare template
- * (cloudflare/ai demos/remote-mcp-github-oauth/src/workers-oauth-utils.ts).
- * workers-oauth-provider itself renders no UI: the defaultHandler owns consent.
+ * Cloudflare 公式テンプレート（cloudflare/ai の
+ * demos/remote-mcp-github-oauth/src/workers-oauth-utils.ts）を土台にしている。
+ * workers-oauth-provider 自体は UI を描画せず、defaultHandler 側が同意画面を持つ。
  *
- * Ordering that the MCP spec's confused-deputy mitigation requires, and which
- * this file preserves from the template:
- *   GET  /authorize -> only a CSRF cookie is set; nothing is approved yet
- *   POST /authorize -> user pressed Approve; only *now* are the approved-client
- *                      cookie and the consented-state binding issued, and only
- *                      then is the browser forwarded to GitHub
- * i.e. per-client consent is always taken *before* the third-party redirect.
+ * MCP の confused-deputy 対策が要求する順序（テンプレートから継承）:
+ *   GET  /authorize -> CSRF cookie を発行するだけで、まだ何も承認しない
+ *   POST /authorize -> Approve が押された後で初めて approved-client cookie と
+ *                      state 紐付けを発行し、そのときだけ GitHub へ転送する
+ * つまりサードパーティへのリダイレクト前に必ず同意を取る。
  *
- * Divergence from the template (deliberate): the dialog shows the redirect_uri
- * *from this request* instead of only the client's registered list, and warns
- * on loopback redirect URIs. MCP's CIMD security section makes displaying the
- * redirect URI host a MUST and the loopback warning a SHOULD — and with RFC
- * 8252 loopback port flexibility the requested port is exactly what the
- * registered list cannot show.
- *
- * [M-1/P1-1] The pending authorization request itself never round-trips
- * through the browser. GET /authorize commits the *validated* request to KV
- * under a fresh opaque state token (`approved: false`); the dialog form only
- * ever carries that token. POST /authorize looks the request back up by
- * token and flips it to `approved: true` — it never parses request data out
- * of the form. /callback's validateOAuthState() refuses anything still
- * `approved: false`.
+ * テンプレートからの意図的な改変、[M-1/P1-1] の state 不透明トークン化と
+ * 所有者束縛の詳細は docs/design-notes.md 参照。
  */
 import type { AuthRequest, ClientInfo } from "@cloudflare/workers-oauth-provider";
 
@@ -35,7 +21,7 @@ const CONSENTED_STATE_COOKIE = "__Host-CONSENTED_STATE";
 const APPROVED_CLIENTS_COOKIE = "__Host-APPROVED_CLIENTS";
 const STATE_TTL_SECONDS = 600;
 const APPROVAL_TTL_SECONDS = 30 * 24 * 60 * 60;
-/** [L-10] Cap on the approved-clients cookie: a trust list, not an audit log. */
+/** [L-10] approved-clients cookie の件数上限。詳細は docs/design-notes.md 参照。 */
 const APPROVED_CLIENTS_MAX_ENTRIES = 10;
 
 /** OAuth 2.1 shaped error that can be turned straight into a response. */
@@ -57,7 +43,7 @@ export class OAuthError extends Error {
   }
 }
 
-// ---------------------------------------------------------------- sanitizing
+// ---------------------------------------------------------------- サニタイズ
 
 export function sanitizeText(text: string): string {
   return text
@@ -68,7 +54,7 @@ export function sanitizeText(text: string): string {
     .replace(/'/g, "&#039;");
 }
 
-/** Allows only http/https URLs; everything else (javascript:, data:, …) becomes "". */
+/** http/https の URL のみ許可。それ以外（javascript:, data:, …）は "" にする。 */
 export function sanitizeUrl(url: string): string {
   const normalized = url.trim();
   if (normalized.length === 0) return "";
@@ -86,17 +72,12 @@ export function sanitizeUrl(url: string): string {
   return scheme === "http" || scheme === "https" ? normalized : "";
 }
 
-// ---------------------------------------------------------- base64url helpers
+// ---------------------------------------------------------- base64url ヘルパー
 
 /**
- * [L-3] btoa()/atob() operate on Latin-1 code units and throw a DOMException
- * for any character above U+00FF. The approved-clients cookie payload is a
- * JSON array of `JSON.stringify([clientId, redirectUri])` tuple strings,
- * which can legitimately contain non-Latin-1 text (e.g. a CIMD client_id URL
- * with an internationalized domain), so encoding goes through UTF-8 bytes
- * first.
- * base64url (RFC 4648 §5, no padding) also keeps the cookie value free of
- * `+`, `/`, `=`, which would otherwise need escaping in a Cookie header.
+ * [L-3] btoa()/atob() は Latin-1 しか扱えないため、一度 UTF-8 バイト列を
+ * 経由してからエンコードする（base64url、RFC 4648 §5、パディングなし）。
+ * 経緯は docs/design-notes.md 参照。
  */
 function base64UrlEncode(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -133,7 +114,7 @@ function readCookie(request: Request, name: string): string | null {
   return hit ? hit.substring(name.length + 1) : null;
 }
 
-/** RFC 9700 §2.1: CSRF tokens are one-time use, so the cookie is cleared here. */
+/** RFC 9700 §2.1: CSRF トークンはワンタイムなのでここで cookie を消す。 */
 export function validateCSRFToken(formData: FormData, request: Request): { clearCookie: string } {
   const fromForm = formData.get("csrf_token");
   if (!fromForm || typeof fromForm !== "string") {
@@ -147,7 +128,7 @@ export function validateCSRFToken(formData: FormData, request: Request): { clear
   };
 }
 
-// ------------------------------------------------------------- OAuth state
+// ------------------------------------------------------------- OAuth の state
 
 async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -156,41 +137,31 @@ async function sha256Hex(value: string): Promise<string> {
     .join("");
 }
 
-/** KV-stored shape behind an `oauth:state:<token>` key. */
+/** `oauth:state:<token>` キーの KV 保存形状。 */
 interface StoredOAuthState {
   oauthReqInfo: AuthRequest;
-  /** [M-1/P1-1] Only approveOAuthState() may flip this to true. */
+  /** [M-1/P1-1] approveOAuthState() だけがこれを true にできる。 */
   approved: boolean;
   /**
-   * [state ownership] sha256 hex of the CSRF token this state was minted
-   * alongside, or `null` for a state created on the GET /authorize
-   * preapproved fast path — that path never shows the dialog and so never
-   * issues a CSRF cookie/token at all, so there is nothing to pair against.
-   * approveOAuthState() treats `null` as "no CSRF pairing required for this
-   * state" rather than as a match to be satisfied.
+   * [state ownership] この state を発行したときの CSRF トークンの sha256。
+   * プレアプルーブ経路（CSRF を発行しない）では `null`。詳細は
+   * docs/design-notes.md 参照。
    */
   csrfTokenHash: string | null;
   /**
-   * [state lifetime cap] Unix ms timestamp set once at createOAuthState()
-   * and never rewritten by approveOAuthState() (which only resets the KV
-   * entry's TTL). validateOAuthState() uses this to cap a state's total
-   * lifetime at STATE_TTL_SECONDS regardless of how many times its KV TTL
-   * gets refreshed in between.
+   * [state lifetime cap] state 全体の生存期間の上限を計算するための
+   * 作成時刻（一度だけ記録、以後書き換えない）。詳細は
+   * docs/design-notes.md 参照。
    */
   createdAt: number;
 }
 
 /**
- * Stores a not-yet-approved authorization request under a fresh opaque state
- * token. Called once, immediately after parseAuthRequest() validates the
- * request — nothing client-controlled is ever parsed back out of a form
- * field to reconstruct it.
+ * 未承認の認可リクエストを、新しい不透明な state トークンの下に KV へ保存する。
+ * parseAuthRequest() がリクエストを検証した直後に一度だけ呼ぶ。
  *
- * [state ownership] `csrfToken`, when given, is hashed and committed here so
- * approveOAuthState() can later verify that whoever is approving this exact
- * state also holds the exact CSRF token it was minted with. Pass `null` (the
- * default) for the GET /authorize preapproved fast path, which never issues
- * a CSRF token in the first place.
+ * [state ownership] `csrfToken` を渡すとハッシュ化して一緒に刻む。詳細は
+ * docs/design-notes.md 参照。
  */
 export async function createOAuthState(
   oauthReqInfo: AuthRequest,
@@ -211,19 +182,11 @@ export async function createOAuthState(
 }
 
 /**
- * [M-1/P1-1] Flips a pending state's `approved` flag from false to true and
- * returns the authorization request it guards. This is the *only* place
- * that happens: POST /authorize calls it only after the user has just
- * pressed Approve, and the GET /authorize preapproved fast path calls it
- * only after re-verifying an existing (client, redirect_uri) consent.
+ * [M-1/P1-1] 保留中の state の `approved` を false から true に変え、それが
+ * 保護している認可リクエストを返す。これを行うのはここだけ。
  *
- * [state ownership] When the state carries a `csrfTokenHash` (the dialog
- * path), `csrfToken` must hash to it or this throws "State does not belong
- * to this session" — the CSRF cookie/form-field match performed earlier
- * (validateCSRFToken) only proves that pair is internally consistent, not
- * that it belongs to the flow this particular stateToken was minted for. A
- * `csrfTokenHash` of `null` (the preapproved fast path) skips this check
- * entirely; pass `null` for `csrfToken` there.
+ * [state ownership] state が `csrfTokenHash` を持つ場合、`csrfToken` が
+ * それにハッシュ一致しなければ拒否する。詳細は docs/design-notes.md 参照。
  */
 export async function approveOAuthState(
   stateToken: string,
@@ -254,11 +217,9 @@ export async function approveOAuthState(
 }
 
 /**
- * [dialog denial] Looks up a pending state by its opaque token and deletes it
- * from KV — without ever flipping `approved`. Called only when the user
- * pressed Cancel/Deny on the consent dialog: the pending authorization
- * request must never become approvable afterwards, and the one-time state
- * token must not be replayable a second time (approve or deny) once denied.
+ * [dialog denial] 保留中の state を KV から削除する（`approved` は変えない）。
+ * ユーザーが同意画面で Cancel/Deny を押したときだけ呼ぶ。詳細は
+ * docs/design-notes.md 参照。
  */
 export async function rejectOAuthState(stateToken: string, kv: KVNamespace): Promise<AuthRequest> {
   const key = `oauth:state:${stateToken}`;
@@ -277,9 +238,9 @@ export async function rejectOAuthState(stateToken: string, kv: KVNamespace): Pro
 }
 
 /**
- * Binds the state token to this browser. The cookie holds the *hash* of the
- * token, so a state value leaking through URL logs or a Referer header still
- * cannot be replayed from another browser.
+ * state トークンをこのブラウザに束縛する。cookie にはトークンの*ハッシュ*だけを
+ * 持たせるので、URL ログや Referer 経由で state 値が漏れても、別ブラウザから
+ * 再利用できない。
  */
 export async function bindStateToSession(stateToken: string): Promise<{ setCookie: string }> {
   const hash = await sha256Hex(stateToken);
@@ -289,9 +250,8 @@ export async function bindStateToSession(stateToken: string): Promise<{ setCooki
 }
 
 /**
- * Validates the state coming back from GitHub against KV (we created it),
- * the session cookie (this browser consented to it), and the `approved`
- * flag (this server itself marked it approved — see approveOAuthState()).
+ * GitHub から返ってきた state を、KV（自分で作った）・セッション cookie
+ * （このブラウザが同意した）・`approved` フラグ（自分で承認した）の3点で検証する。
  */
 export async function validateOAuthState(
   request: Request,
@@ -326,21 +286,15 @@ export async function validateOAuthState(
     throw new OAuthError("server_error", "Invalid state data", 500);
   }
 
-  // [state lifetime cap] approveOAuthState() resets this record's KV TTL to
-  // another full STATE_TTL_SECONDS on approval, so a dialog left open just
-  // under that window can otherwise stretch a state's real lifetime to
-  // nearly twice STATE_TTL_SECONDS. `createdAt` is fixed at createOAuthState()
-  // and never rewritten, so checking it here caps the total lifetime at
-  // STATE_TTL_SECONDS regardless of any TTL resets in between.
+  // [state lifetime cap] createdAt を基準に生存期間を STATE_TTL_SECONDS に
+  // 固定する。経緯は docs/design-notes.md 参照。
   if (Date.now() - record.createdAt > STATE_TTL_SECONDS * 1000) {
     await kv.delete(`oauth:state:${stateFromQuery}`);
     throw new OAuthError("invalid_request", "State has expired", 400);
   }
 
-  // [M-1/P1-1] Server-side assert: only a state this server itself flipped to
-  // approved (via the dialog POST, or the preapproved fast path) may reach
-  // completeAuthorization(). Defense in depth on top of the session-cookie
-  // binding above, which already makes this unreachable in the normal flow.
+  // [M-1/P1-1] サーバー側での多層防御アサート: 自分自身が承認した state だけが
+  // completeAuthorization() に到達できる。
   if (!record.approved) {
     throw new OAuthError("invalid_request", "Authorization was never approved", 400);
   }
@@ -352,12 +306,11 @@ export async function validateOAuthState(
   };
 }
 
-// -------------------------------------------------- approved-clients cookie
+// -------------------------------------------------- 承認済みクライアント cookie
 
 async function importKey(secret: string): Promise<CryptoKey> {
-  // [L-9] A blank or short COOKIE_ENCRYPTION_KEY makes the approved-clients
-  // cookie's HMAC weak or trivially guessable. Fail loudly at the point of
-  // use instead of silently minting a cookie nothing meaningfully protects.
+  // [L-9] COOKIE_ENCRYPTION_KEY が短いと HMAC が弱くなるため使用箇所で
+  // 即座に失敗させる。経緯は docs/design-notes.md 参照。
   if (!secret || secret.length < 32) {
     throw new Error("COOKIE_ENCRYPTION_KEY must be set and at least 32 characters long");
   }
@@ -397,7 +350,7 @@ async function verifySignature(
   );
 }
 
-/** Exported for direct unit testing (test/approval.test.ts); not otherwise part of the public API surface. */
+/** ユニットテスト（test/approval.test.ts）向けに export。公開 API の一部ではない。 */
 export async function readApprovedClients(request: Request, secret: string): Promise<string[] | null> {
   const cookie = readCookie(request, APPROVED_CLIENTS_COOKIE);
   if (!cookie) return null;
@@ -423,23 +376,14 @@ export async function readApprovedClients(request: Request, secret: string): Pro
 }
 
 /**
- * [H-1] Consent is keyed by (clientId, redirectUri), not clientId alone: a
- * client that is later handed (via CIMD) or registers a second redirect_uri
- * must get a fresh consent screen for it. The dialog's displayed redirect
- * host is, per MCP's CIMD security guidance, a MUST — consent to one host
- * must not silently cover another.
- *
- * A JSON tuple rather than a `${clientId}|${redirectUri}` join: either field
- * can itself contain `|` (arbitrary URL text), which would let two distinct
- * (clientId, redirectUri) pairs collide onto the same joined string —
- * `JSON.stringify` escapes each element independently, so no such ambiguity
- * is possible.
+ * [H-1] 同意は (clientId, redirectUri) のペア単位で管理する（clientId 単独ではない）。
+ * JSON タプルにする理由も含め、経緯は docs/design-notes.md 参照。
  */
 function approvalKey(clientId: string, redirectUri: string): string {
   return JSON.stringify([clientId, redirectUri]);
 }
 
-/** Has this browser already consented to this exact (client, redirect_uri) pair? */
+/** このブラウザは、この (client, redirect_uri) ペアに既に同意済みか？ */
 export async function isClientApproved(
   request: Request,
   clientId: string,
@@ -452,9 +396,8 @@ export async function isClientApproved(
 }
 
 /**
- * Records consent for one (client, redirect_uri) pair. Called only after the
- * user pressed Approve (or, on the preapproved fast path, only after an
- * earlier Approve already covered this exact pair).
+ * (client, redirect_uri) ペアへの同意を記録する。ユーザーが Approve を
+ * 押した後（またはプレアプルーブ経路で既に同意済みと確認できた後）にだけ呼ぶ。
  */
 export async function addApprovedClient(
   request: Request,
@@ -464,12 +407,7 @@ export async function addApprovedClient(
 ): Promise<string> {
   const key = approvalKey(clientId, redirectUri);
   const existing = (await readApprovedClients(request, secret)) || [];
-  // [L-10] Keep only the most recently approved entries — a trust list, not
-  // an ever-growing audit log. Any existing occurrence of this exact key is
-  // dropped before re-appending it, so re-approving a pair moves it to the
-  // end (most-recently-approved) instead of leaving it pinned at its
-  // original position — `Array.from(new Set(...))` alone does not do this,
-  // since Set preserves the position of a key's *first* insertion.
+  // [L-10] 直近承認分だけを保持する信頼リスト。詳細は docs/design-notes.md 参照。
   const trimmed = [...existing.filter((entry) => entry !== key), key].slice(
     -APPROVED_CLIENTS_MAX_ENTRIES,
   );
@@ -478,9 +416,9 @@ export async function addApprovedClient(
   return `${APPROVED_CLIENTS_COOKIE}=${signature}.${base64UrlEncode(payload)}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${APPROVAL_TTL_SECONDS}`;
 }
 
-// ------------------------------------------------------------------- dialog
+// ------------------------------------------------------------------- ダイアログ
 
-/** 127.0.0.0/8, ::1, or localhost — mirrors the provider's isLoopbackUri(). */
+/** 127.0.0.0/8、::1、localhost — provider の isLoopbackUri() を踏襲。 */
 export function isLoopbackRedirectUri(uri: string): boolean {
   try {
     const host = new URL(uri).hostname.toLowerCase();
@@ -497,16 +435,14 @@ export function isLoopbackRedirectUri(uri: string): boolean {
 
 export interface ApprovalDialogOptions {
   client: ClientInfo | null;
-  /** The redirect_uri of *this* request, not the registered list. */
+  /** 登録済みリストではなく、*この*リクエストの redirect_uri。 */
   requestedRedirectUri: string;
-  /** True when client_id is a Client ID Metadata Document URL. */
+  /** client_id が Client ID Metadata Document の URL なら true。 */
   isCimdClient: boolean;
   server: { name: string; description?: string };
   /**
-   * [M-1/P1-1] The opaque state token created by createOAuthState(). The
-   * dialog form round-trips only this token — the authorization request
-   * itself lives solely in KV, server-side, from the moment
-   * parseAuthRequest() validated it.
+   * [M-1/P1-1] createOAuthState() が発行した不透明な state トークン。
+   * 詳細は docs/design-notes.md 参照。
    */
   stateToken: string;
   csrfToken: string;
@@ -525,7 +461,7 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
   try {
     redirectHost = sanitizeText(new URL(requestedRedirectUri).host);
   } catch {
-    /* keep the placeholder */
+    /* プレースホルダーのまま維持 */
   }
 
   let cimdHost = "";
@@ -589,35 +525,14 @@ export function renderApprovalDialog(options: ApprovalDialogOptions): Response {
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Set-Cookie": setCookie,
-      // [L-2] This page's content depends on per-request/per-session state
-      // (the client, the redirect_uri, the CSRF cookie) and must never be
-      // served from a shared cache.
+      // [L-2] このページはリクエスト/セッション固有の状態に依存するため
+      // 共有キャッシュから配信してはならない。詳細は docs/design-notes.md 参照。
       "Cache-Control": "no-store",
-      // [dialog hardening] This page renders client-supplied text
-      // (clientName, clientId, the requested redirect_uri) that
-      // sanitizeText()/sanitizeUrl() already escape; CSP is the second layer
-      // of defense in depth in case a future edit introduces an unescaped
-      // interpolation. `default-src 'none'` blocks everything by default;
-      // `style-src 'unsafe-inline'` is required for this page's own inline
-      // `<style>` block.
-      //
-      // Deliberately no `form-action` directive. Chrome checks form-action
-      // against *every* hop of the post-submit redirect chain, not just the
-      // form's immediate action target: POST /authorize (self) -> 302
-      // https://github.com/login/oauth/authorize -> ... -> 302 /callback ->
-      // 302 to the MCP client's own redirect_uri, which for a loopback CLI
-      // client is an *arbitrary, per-run port* (RFC 8252) and for a CIMD
-      // client can be an arbitrary https origin entirely outside this
-      // server's control. An allowlist naming this origin plus
-      // https://github.com still gets blocked on that final hop, because the
-      // client's redirect_uri is neither. There is no fixed allowlist that
-      // covers a redirect target this server cannot predict, so no
-      // form-action directive can be correct here — this was observed
-      // breaking the Approve flow twice against a real browser (Chrome)
-      // driving the Claude Code OAuth login; curl and unit tests never
-      // exercise browser-side redirect-chain enforcement, so neither caught
-      // it. Defense here instead rests on `default-src 'none'` plus
-      // sanitizing every value interpolated into this page.
+      // [dialog hardening] クライアント由来の文字列は sanitizeText()/
+      // sanitizeUrl() で既にエスケープ済み。CSP は将来のエスケープ漏れに
+      // 備えた第二層の防御。`form-action` を持たせない理由（リダイレクト
+      // チェーンの検査で実ブラウザの Approve フローを2回壊した経緯）は
+      // docs/design-notes.md 参照。
       "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
       "X-Content-Type-Options": "nosniff",
     },

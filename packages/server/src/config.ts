@@ -1,22 +1,16 @@
-/** Constants shared by the AS entry, the consent handler, and the MCP server. */
+/** AS のエントリ、consent ハンドラ、MCP サーバーで共有する定数。 */
 
 export const SERVER_NAME = "todo-mcp";
 export const SERVER_DESCRIPTION = "個人用 Todo MCP サーバー。続行するには GitHub でサインインしてください。";
 export const SERVER_VERSION = "0.0.1";
 
-/** The MCP endpoint path. Also the OAuthProvider apiRoute. */
+/** MCP エンドポイントのパス。OAuthProvider の apiRoute でもある。 */
 export const MCP_ROUTE = "/mcp";
 
 /**
- * Scopes advertised in AS metadata and in the RFC 9728 resource metadata.
+ * AS メタデータおよび RFC 9728 リソースメタデータで advertise するスコープ。
  *
- * One scope covering the server's basic functionality, per the spec's guidance
- * that `scopes_supported` is the *minimum set needed for basic functionality*
- * rather than a full catalogue.
- *
- * `offline_access` is deliberately absent: MCP final (Refresh Tokens) says a
- * resource server SHOULD NOT advertise it, because refreshing is a client/AS
- * concern and never a requirement of the resource itself. Refresh tokens still
- * work — workers-oauth-provider issues them on the authorization_code grant.
+ * `todo` の1スコープのみ。`offline_access` を含めない理由は
+ * docs/design-notes.md 参照。
  */
 export const SCOPES_SUPPORTED: readonly string[] = ["todo"];

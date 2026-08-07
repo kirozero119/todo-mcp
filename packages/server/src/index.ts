@@ -1,11 +1,11 @@
 /**
- * Worker entry.
+ * Worker のエントリポイント。
  *
- * Layout:
- *   Origin guard  -> /mcp only, runs before anything else (see below)
- *   OAuthProvider -> /authorize (parse), /token, /register, /.well-known/*
- *     apiRoute /mcp     -> mcpApiHandler  (only with a valid token)
- *     defaultHandler    -> GitHubHandler  (consent dialog, GitHub redirect, callback)
+ * 構成:
+ *   Origin ガード -> /mcp のみ、他の何よりも先に実行（下記参照）
+ *   OAuthProvider -> /authorize（パース）、/token、/register、/.well-known/*
+ *     apiRoute /mcp     -> mcpApiHandler（有効なトークンがある場合のみ）
+ *     defaultHandler    -> GitHubHandler（同意画面、GitHub リダイレクト、コールバック）
  */
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { localhostAllowedOrigins, originValidationResponse } from "@modelcontextprotocol/server";
@@ -28,53 +28,35 @@ const provider = new OAuthProvider<Env>({
   authorizeEndpoint: "/authorize",
   tokenEndpoint: "/token",
 
-  // Client registration, both ways the MCP spec allows:
-  //  - CIMD  : preferred by the spec; needs the global_fetch_strictly_public
-  //            compatibility flag or the provider refuses to fetch the document
-  //            and advertises client_id_metadata_document_supported: false.
-  //  - DCR   : deprecated by the spec but kept for clients that lack CIMD.
+  // クライアント登録は MCP 仕様が許す両方式に対応:
+  //  - CIMD: 仕様上の推奨。global_fetch_strictly_public 互換フラグが必要
+  //  - DCR : 仕様上は非推奨だが、CIMD 非対応クライアント用に維持
   clientRegistrationEndpoint: "/register",
   clientIdMetadataDocumentEnabled: true,
-  // [M-4] DCR registrations expire instead of accumulating in KV forever.
-  // Kept at the provider's own default (90 days) rather than shortened: the
-  // refresh token TTL is 30 days, and a clientRegistrationTTL shorter than
-  // that (7 days, as this used to be) lets the `client:<id>` KV record
-  // expire while a still-valid refresh token is outstanding, turning an
-  // otherwise-normal refresh into `invalid_client` on day 8. 90 days
-  // comfortably outlives the refresh token; CIMD clients re-fetch their
-  // document on every use and never hit this at all.
+  // [M-4] DCR 登録の TTL。トークンの寿命より長くするのが原則。
+  // 90日（provider 既定値）にした経緯（7日だとリフレッシュトークンより先に失効していた）は
+  //  docs/design-notes.md 参照。
   clientRegistrationTTL: 60 * 60 * 24 * 90,
 
-  // MCP requires S256 PKCE. The provider still defaults allowPlainPKCE to true
-  // (dist/oauth-provider.js: `allowPlainPKCE !== false ? ["plain","S256"] : ["S256"]`),
-  // and treats a missing code_challenge_method as "plain" — so turning this off
-  // both drops `plain` from the advertised methods and makes PKCE mandatory.
+  // MCP は S256 PKCE を必須とする。provider の既定は allowPlainPKCE: true
+  // なので、明示的に false にして plain を排除し PKCE を必須化する。
   allowPlainPKCE: false,
 
+  // ASが発行しうる権限の種類
   scopesSupported: [...SCOPES_SUPPORTED],
 
-  // [resource audience symmetry] github-handler.ts's /callback audience
-  // completion (search for P1-2/L-7 there) fills in a *bare origin*
-  // (`new URL(...).origin`) for clients that omit RFC 8707 `resource`, so
-  // those grants end up with an origin-shaped resource. Without this flag,
-  // /token's resourceMatches() requires an exact match, so a well-behaved
-  // client that later sends the fuller `resource=<origin>/mcp` (matching
-  // this server's actual apiRoute) gets `invalid_target` against its own
-  // grant. Comparing scheme+host+port only removes that asymmetry.
+  // [resource audience symmetry] github-handler.ts の /callback audience 補完
+  // ([P1-2/L-7]) と対になる設定。経緯は docs/design-notes.md 参照。
   resourceMatchOriginOnly: true,
 
-  // `resource` and `authorization_servers` are intentionally left to the
-  // provider, which derives them from the request URL: hardcoding them would
-  // pin the document to one origin and break either local dev or production.
+  // `resource` と `authorization_servers` は provider に任せる（リクエスト
+  // URL から導出させる）。固定するとローカル/本番のどちらかが壊れる。
   resourceMetadata: { resource_name: SERVER_NAME },
 
-  // Every DCR registration, so the logs show which registration path a client
-  // used even when it never reaches /authorize. Returning nothing = allow.
+  // すべての DCR 登録をログに残す。何も返さなければ登録は許可される。
   //
-  // [M-4] Also the enforcement point for isAllowedRegistrationRedirectUri():
-  // the provider itself only blocks a short list of dangerous schemes, so a
-  // client could otherwise register a plain-http or arbitrary-scheme
-  // redirect_uri and have it accepted at /authorize later.
+  // [M-4] isAllowedRegistrationRedirectUri() の実際の強制ポイント。詳細は
+  // docs/design-notes.md 参照。
   clientRegistrationCallback: ({ clientMetadata }) => {
     console.log(
       `[oauth] ${JSON.stringify({
@@ -105,10 +87,8 @@ const provider = new OAuthProvider<Env>({
   onError: ({ code, description, status, headers }) => {
     console.log(`[oauth] ${JSON.stringify({ event: "error", code, status, description })}`);
 
-    // [M-2/P1-3] RFC 6750 §3 has the resource server advertise its required
-    // scope on a 401 so a well-behaved client can tell "not authenticated"
-    // apart from "authenticated but missing the todo scope" without a
-    // separate round trip.
+    // [M-2/P1-3] RFC 6750 §3: 401 に必要な scope を追記する。経緯は
+    // docs/design-notes.md 参照。
     if (status === 401 && code === "invalid_token") {
       const wwwAuthenticate = headers["WWW-Authenticate"];
       if (wwwAuthenticate) {
@@ -127,36 +107,26 @@ const provider = new OAuthProvider<Env>({
 });
 
 /**
- * DNS rebinding protection for the MCP endpoint (MCP transports spec MUST).
+ * MCP エンドポイントの DNS リバインディング対策（MCP transports 仕様の MUST）。
  *
- * Policy:
- *  - No `Origin` header  -> allowed. MCP clients are CLIs/daemons; they do not
- *    send one, and the header only exists to identify browser-initiated calls.
- *  - `Origin` present    -> must be this host (or a loopback name in local
- *    dev), otherwise 403. That is what stops a page on evil.example from
- *    driving a locally bound MCP server through the victim's browser.
+ * ポリシー:
+ *  - `Origin` ヘッダーなし -> 許可（MCP クライアントは通常 CLI/デーモンで送らない）
+ *  - `Origin` あり -> このホスト自身（またはローカル開発時のループバック名）と
+ *    一致しなければ 403
  *
- * Placed ahead of OAuthProvider on purpose: a cross-origin browser request must
- * be refused as forbidden regardless of whether it carries a token, and a
- * transport-level guard that only runs after authentication is not a guard.
- * `agents/mcp/server` applies its own Origin check further in; this one exists
- * so the rejection happens before any credential handling.
+ * 配置場所（OAuthProvider より前段）と本番でのスコープ限定の経緯は
+ * docs/design-notes.md 参照。
  */
 function originGuard(request: Request): Response | undefined {
   const url = new URL(request.url);
-  // [L-1] Matches the provider's own API-route matching (startsWith), not an
-  // exact match: a bare-equality check here would let a cross-origin browser
-  // request through for any sub-path under MCP_ROUTE (e.g. `/mcp/`) that the
-  // provider itself still treats as the protected API route.
+  // [L-1] provider 自身の API ルート判定（startsWith）に合わせる。完全一致に
+  // すると `MCP_ROUTE` 配下のサブパスが素通りしてしまう。詳細は
+  // docs/design-notes.md 参照。
   if (!url.pathname.startsWith(MCP_ROUTE)) return undefined;
 
-  // [production Origin scoping] `localhostAllowedOrigins()` is only a
-  // meaningful allowance when this Worker's own hostname is itself a
-  // loopback name (`wrangler dev`). Admitting it unconditionally would mean
-  // a production deployment — whose hostname is never loopback — still
-  // accepted `Origin: http://localhost:...`, letting any page running a
-  // local dev server on the visitor's machine pass this guard for an origin
-  // this deployment never actually serves from.
+  // [production Origin scoping] Worker 自身のホスト名がループバックのときだけ
+  // localhostAllowedOrigins() を許可リストに加える。経緯は
+  // docs/design-notes.md 参照。
   const allowed = isLoopbackRedirectUri(`http://${url.hostname}`)
     ? [...localhostAllowedOrigins(), url.hostname]
     : [url.hostname];

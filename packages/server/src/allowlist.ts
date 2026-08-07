@@ -1,15 +1,16 @@
 /**
- * Access-control primitives.
+ * アクセス制御のプリミティブ群。
  *
- * Kept free of Worker/runtime imports so the authorization decision can be
- * unit-tested directly (`test/allowlist.test.ts`). Nothing here performs I/O.
+ * Worker/ランタイム依存の import を持たない。認可判定を
+ * `test/allowlist.test.ts` で直接ユニットテストできるようにするため。
+ * ここには I/O を行う処理は一切ない。
  */
 
 /**
- * Parses ALLOWED_GITHUB_USERS ("alice, bob") into a normalized list.
+ * ALLOWED_GITHUB_USERS（"alice, bob"）を正規化したリストにパースする。
  *
- * GitHub logins are case-insensitive and unique case-insensitively, so the
- * comparison key is the lowercased login.
+ * GitHub のログイン名は大小文字を区別せず一意なので、比較キーは
+ * 小文字化したログイン名にする。
  */
 export function parseAllowedGitHubUsers(raw: string | undefined | null): string[] {
   if (!raw) return [];
@@ -19,24 +20,13 @@ export function parseAllowedGitHubUsers(raw: string | undefined | null): string[
     .filter((entry) => entry.length > 0);
 }
 
-/** Matches an ALLOWED_GITHUB_USERS entry of the form `github:<numeric id>`. */
+/** `github:<numeric id>` 形式の ALLOWED_GITHUB_USERS エントリにマッチ。 */
 const GITHUB_ID_ENTRY = /^github:(\d+)$/;
 
 /**
- * Is this GitHub identity allowed to obtain a grant?
+ * この GitHub アイデンティティに grant を許可するか。
  *
- * [M-3/P2-1] Two entry formats are accepted in ALLOWED_GITHUB_USERS:
- *  - a bare login (`octocat`)            — compared case-insensitively
- *  - `github:<numeric id>` (`github:1`)  — compared against the immutable
- *    numeric id
- *
- * The numeric-id form survives a login rename: GitHub frees a renamed login
- * for anyone else to claim, so an allowlist keyed purely on login can end up
- * granting access to a stranger who later registers the old name.
- *
- * Fails closed: an unset, empty, or whitespace-only ALLOWED_GITHUB_USERS denies
- * everyone. A misconfigured deploy therefore locks the operator out rather than
- * opening the server to every GitHub account on the internet.
+ * [M-3/P2-1] 二形式・フェイルクローズの経緯は docs/design-notes.md 参照。
  */
 export function isGitHubUserAllowed(
   login: string | undefined | null,
@@ -62,11 +52,10 @@ function assertGitHubNumericId(numericId: number): void {
 }
 
 /**
- * The namespaced identity stored in props and, later, used as the DB key.
+ * props に保存する namespace 付き識別子。将来的には DB キーにもなる。
  *
- * Uses the immutable numeric id rather than the login: GitHub logins can be
- * renamed and the freed name can be taken by somebody else. The `github:`
- * prefix reserves room for other IdPs without collision.
+ * ログインではなく不変の数値 ID を使う（ログインはリネームされ得る）。
+ * `github:` プレフィックスは他の IdP と衝突しないための予約。
  */
 export function githubUserId(numericId: number): string {
   assertGitHubNumericId(numericId);
@@ -74,14 +63,10 @@ export function githubUserId(numericId: number): string {
 }
 
 /**
- * The `userId` handed to OAuthProvider.completeAuthorization().
+ * OAuthProvider.completeAuthorization() に渡す `userId`。
  *
- * MUST NOT contain ':'. workers-oauth-provider mints opaque access tokens as
- * `${userId}:${grantId}:${secret}` and validates them by splitting on ':' and
- * requiring exactly 3 parts (dist/oauth-provider.js — createAccessToken /
- * handleApiRequest). A colon in userId yields tokens that can never be
- * validated, so the grant identity uses '-' while props keep the canonical
- * `github:<id>` form.
+ * ':' を含んではいけない。理由は docs/design-notes.md 参照
+ * （userId のコロン制約）。
  */
 export function githubGrantUserId(numericId: number): string {
   assertGitHubNumericId(numericId);
@@ -89,11 +74,11 @@ export function githubGrantUserId(numericId: number): string {
 }
 
 /**
- * Scopes actually granted for an authorization request.
+ * 認可リクエストに対して実際に付与するスコープ。
  *
- * Mirrors the provider's own downscope() semantics: an empty request means
- * "everything this server supports", anything else is intersected with the
- * supported set so a client cannot widen its own grant.
+ * provider 自身の downscope() の意味論を踏襲: 空リクエストは
+ * 「このサーバーが対応する全スコープ」を意味し、それ以外は対応スコープと
+ * の積を取る（クライアントが自分の grant を勝手に広げられないように）。
  */
 export function resolveGrantedScopes(
   requested: readonly string[] | undefined,

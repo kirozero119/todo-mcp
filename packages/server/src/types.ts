@@ -1,56 +1,49 @@
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 
 /**
- * Worker bindings.
+ * Worker のバインディング一覧。
  *
- * Everything except OAUTH_KV / OAUTH_PROVIDER is a secret:
- * - local      : packages/server/.dev.vars (symlink to the repo-root .dev.vars)
- * - production : `wrangler secret put <NAME>` (see README)
+ * OAUTH_KV / OAUTH_PROVIDER 以外はすべてシークレット:
+ * - ローカル: packages/server/.dev.vars（リポジトリルートの .dev.vars へのシンボリックリンク）
+ * - 本番: `wrangler secret put <NAME>`（README 参照）
  */
 export interface Env {
-  /** Grants, tokens, DCR clients, and the short-lived OAuth state records. */
+  /** grant・トークン・DCR クライアント・短命な OAuth state レコードを保持。 */
   OAUTH_KV: KVNamespace;
 
-  /** GitHub OAuth App (this Worker acts as an OAuth *client* towards GitHub). */
+  /** GitHub OAuth App（この Worker は GitHub に対しては OAuth *クライアント*）。 */
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
 
-  /** HMAC key for the signed "clients this browser already approved" cookie. */
+  /** 「このブラウザが承認済みのクライアント」cookie の署名用 HMAC キー。 */
   COOKIE_ENCRYPTION_KEY: string;
 
   /**
-   * Comma-separated GitHub logins allowed to obtain a grant.
-   * Unset or empty means "nobody" — the check fails closed on purpose.
+   * grant を取得できる GitHub ログイン名のカンマ区切りリスト。
+   * 未設定・空は「誰も許可しない」（意図的なフェイルクローズ）。
    */
   ALLOWED_GITHUB_USERS?: string;
 
-  /** Injected by OAuthProvider before it calls a handler. */
+  /** ハンドラ呼び出し前に OAuthProvider が注入する。 */
   OAUTH_PROVIDER: OAuthHelpers;
 }
 
 /**
- * Application props: encrypted into the access token by workers-oauth-provider,
- * decrypted back into `ctx.props` on every authenticated /mcp request, and read
- * inside tools via `getMcpAuthContext().props`.
+ * アプリケーション props。workers-oauth-provider によってアクセストークンに
+ * 暗号化され、認証済み /mcp リクエストのたびに `ctx.props` に復号され、
+ * ツール内では `getMcpAuthContext().props` で読める。
  *
- * Deliberately does NOT carry the upstream GitHub access token. The GitHub
- * OAuth scope is empty (identity only), so there is nothing to call GitHub for
- * after the callback; not storing it keeps the blast radius of a leaked
- * todo-mcp token limited to todo-mcp. (MCP spec: never pass a client token
- * through to an upstream API — a token we never hold cannot be passed through.)
+ * upstream の GitHub アクセストークンは意図的に持たない。理由は
+ * docs/design-notes.md 参照。
  */
 export type Props = {
-  /** GitHub login at the time of authorization. Display only — logins are renameable. */
+  /** 認可時点の GitHub ログイン名。表示専用（ログインはリネームされ得る）。 */
   login: string;
-  /** Stable namespaced identity: `github:<numeric id>`. This is the future DB key. */
+  /** 安定した namespace 付き識別子: `github:<数値ID>`。将来の DB キー。 */
   user_id: string;
   /**
-   * [scope enforcement] Scopes actually granted to this token
-   * (resolveGrantedScopes() output at /callback time, mirrored into both the
-   * grant's `scope` and this field). mcp.ts's apiHandler checks this against
-   * SCOPES_SUPPORTED before any tool call is reached — the actual
-   * enforcement point behind the `scope="todo"` this server already
-   * advertises on a 401.
+   * [scope enforcement] このトークンに実際に付与されたスコープ。
+   * 強制ポイントの詳細は docs/design-notes.md 参照。
    */
   scopes: string[];
 };

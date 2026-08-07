@@ -1,15 +1,15 @@
 /**
- * This Worker's *client* half: talking to GitHub as an ordinary OAuth client.
+ * この Worker の*クライアント*側の半分: 普通の OAuth クライアントとして GitHub と話す。
  *
- * The provider half (being an Authorization Server to MCP clients) lives in
- * index.ts / github-handler.ts.
+ * provider 側（MCP クライアントに対する Authorization Server）は
+ * index.ts / github-handler.ts にある。
  */
 
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token";
 const GITHUB_USER_URL = "https://api.github.com/user";
 
-/** GitHub's API rejects requests without a User-Agent. */
+/** GitHub の API は User-Agent がないリクエストを拒否する。 */
 const USER_AGENT = "todo-mcp";
 
 export interface GitHubIdentity {
@@ -18,12 +18,10 @@ export interface GitHubIdentity {
 }
 
 /**
- * Builds the upstream authorize URL.
+ * upstream の認可 URL を組み立てる。
  *
- * No `scope` parameter at all. GitHub then issues a token with an empty scope,
- * which is still enough for GET /user to return `login` and `id` — all we need
- * for identity. Asking for `read:user` would let a leaked upstream token read
- * profile data we never use.
+ * `scope` パラメータは一切渡さない（空スコープでも GET /user は
+ * `login`/`id` を返す。詳細は docs/design-notes.md 参照）。
  */
 export function buildGitHubAuthorizeUrl(params: {
   clientId: string;
@@ -42,7 +40,7 @@ export type ExchangeResult =
   | { ok: true; accessToken: string }
   | { ok: false; reason: string };
 
-/** Exchanges the GitHub authorization code for an upstream access token. */
+/** GitHub の認可コードを upstream のアクセストークンと交換する。 */
 export async function exchangeGitHubCode(params: {
   clientId: string;
   clientSecret: string;
@@ -70,8 +68,7 @@ export async function exchangeGitHubCode(params: {
     return { ok: false, reason: `token endpoint returned HTTP ${response.status}` };
   }
 
-  // With Accept: application/json GitHub answers JSON; it also reports failures
-  // with HTTP 200 and an `error` field, so the body has to be inspected.
+  // GitHub は失敗時も HTTP 200 で `error` フィールドを返すため、ボディを見て判定する。
   const body = (await response.json()) as { access_token?: string; error?: string };
   if (body.error) return { ok: false, reason: `token endpoint error: ${body.error}` };
   if (!body.access_token) return { ok: false, reason: "token endpoint returned no access_token" };
@@ -79,10 +76,10 @@ export async function exchangeGitHubCode(params: {
 }
 
 /**
- * Reads the authenticated user's identity.
+ * 認証済みユーザーのアイデンティティを読む。
  *
- * Only `login` and `id` are kept; `id` is the immutable one and becomes
- * `github:<id>` in props.
+ * 保持するのは `login` と `id` のみ。`id` が不変で、props の
+ * `github:<id>` になる（詳細は allowlist.ts の設計ノート参照）。
  */
 export async function fetchGitHubIdentity(accessToken: string): Promise<GitHubIdentity | null> {
   const response = await fetch(GITHUB_USER_URL, {

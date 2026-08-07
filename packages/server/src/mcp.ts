@@ -1,15 +1,14 @@
 /**
- * The MCP server itself (Resource Server side).
+ * MCP サーバー本体（Resource Server 側）。
  *
- * SDK v2 `McpServer` factory handed to `createMcpHandler` from
- * `agents/mcp/server`. Stateless — no Durable Objects. The `legacy` option is
- * left at its default `'stateless'` so 2025-era handshakes still work; today's
- * Claude Code connects that way.
+ * SDK v2 の `McpServer` ファクトリを `agents/mcp/server` の
+ * `createMcpHandler` に渡す。ステートレス（Durable Objects なし）。`legacy`
+ * オプションは既定の `'stateless'` のままにし、2025年当時のハンドシェイクも
+ * 動くようにしている（今の Claude Code もその方式で接続する）。
  *
- * Only reached for requests that already carry a valid token: OAuthProvider
- * validates the bearer token, decrypts the grant's props into `ctx.props`, and
- * only then calls this handler. The agents wrapper lifts `ctx.props` into an
- * AsyncLocalStorage context that `getMcpAuthContext()` reads.
+ * 有効なトークンを持つリクエストにしか到達しない: OAuthProvider がベアラー
+ * トークンを検証し、grant の props を `ctx.props` に復号してからこのハンドラを
+ * 呼ぶ。`getMcpAuthContext()` はそれを AsyncLocalStorage 経由で読む。
  */
 import { createMcpHandler, getMcpAuthContext } from "agents/mcp/server";
 import { McpServer } from "@modelcontextprotocol/server";
@@ -18,12 +17,12 @@ import { z } from "zod";
 import { MCP_ROUTE, SCOPES_SUPPORTED, SERVER_NAME, SERVER_VERSION } from "./config";
 import type { Props } from "./types";
 
-/** Reads the authenticated identity for the request currently being served. */
+/** 現在処理中のリクエストの認証済みアイデンティティを読む。 */
 function currentProps(): Partial<Props> {
   return (getMcpAuthContext()?.props ?? {}) as Partial<Props>;
 }
 
-/** Exported so tests can mount it with an explicit auth context. */
+/** テストが明示的な認証コンテキストでマウントできるように export。 */
 export const createTodoMcpServer = () => {
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
@@ -45,9 +44,9 @@ export const createTodoMcpServer = () => {
     async () => {
       const { login, user_id } = currentProps();
       if (!login || !user_id) {
-        // Should be unreachable: OAuthProvider rejects unauthenticated requests
-        // before this handler runs. Surfacing it as a tool error rather than
-        // returning a fake identity keeps a props-plumbing regression visible.
+        // 到達不能パス（OAuthProvider が未認証リクエストを先に拒否するため）。
+        // props 配線の将来リグレッションを見えるようにするため、偽の
+        // アイデンティティではなくツールエラーとして表面化させる。
         return {
           content: [
             {
@@ -73,12 +72,9 @@ const handler = createMcpHandler(createTodoMcpServer, { route: MCP_ROUTE });
 const REQUIRED_SCOPE = "todo";
 
 /**
- * [scope enforcement] index.ts's onError() advertises `scope="todo"` on
- * every 401 (RFC 6750 §3), but until now nothing on the resource-server side
- * ever checked a token's *granted* scope against it — any authenticated
- * token reached every tool regardless of what resolveGrantedScopes()
- * actually granted it at /callback time. This is the missing enforcement
- * point the 401 response was implying already existed.
+ * [scope enforcement] `props.scopes` に `todo` が含まれるかを確認する。
+ * 401 の scope 広告に対応する実際の強制ポイント。詳細は
+ * docs/design-notes.md 参照。
  */
 function hasRequiredScope(props: Partial<Props> | undefined): boolean {
   return Array.isArray(props?.scopes) && props.scopes.includes(REQUIRED_SCOPE);
@@ -101,14 +97,10 @@ function insufficientScopeResponse(): Response {
 }
 
 /**
- * Wrapped in an ExportedHandler shape because OAuthProvider's `apiHandler`
- * expects `fetch(request, env, ctx)`, while the object returned by
- * createMcpHandler exposes `fetch(request, options)`.
- *
- * Also the scope-enforcement point: OAuthProvider decrypts the grant's props
- * into `ctx.props` before calling this handler (see index.ts), so this is
- * the earliest place `props.scopes` is available to check, before the
- * request ever reaches a tool.
+ * ExportedHandler 形状でラップ: OAuthProvider の apiHandler は
+ * `fetch(request, env, ctx)` を期待するが、createMcpHandler が返すのは
+ * `fetch(request, options)`。スコープ強制の場所でもある（詳細は
+ * docs/design-notes.md 参照）。
  */
 export const mcpApiHandler = {
   fetch: (request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> => {
