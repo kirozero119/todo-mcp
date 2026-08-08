@@ -1,0 +1,25 @@
+{
+  "name": "@todo-mcp/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "todo-mcp の共有ドメイン層 — Zod スキーマ / Task 型 / Turso クライアント / SQL クエリ関数",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tursodatabase/serverless": "^1.4.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

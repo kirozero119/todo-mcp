@@ -3,6 +3,17 @@ import { describe, expect, it } from "vitest";
 
 import { createTodoMcpServer, mcpApiHandler } from "../src/mcp";
 
+/**
+ * `whoami` never touches Turso, so these tests hand it a database that fails
+ * loudly if anything reaches for it. The todo tools' own query behaviour is
+ * covered against a real SQLite in packages/core/test/tasks.test.ts.
+ */
+const TEST_DEPS = {
+  openDb: (): never => {
+    throw new Error("whoami must not open a database");
+  },
+};
+
 /** Minimal ExecutionContext stub carrying `props`, mirroring the shape OAuthProvider hands to `apiHandler`. */
 function ctxWithProps(props: Record<string, unknown>): ExecutionContext {
   return {
@@ -23,7 +34,7 @@ function ctxWithProps(props: Record<string, unknown>): ExecutionContext {
 const PROPS = { login: "octocat", user_id: "github:583231" };
 
 function handlerWithProps(props: Record<string, unknown> | undefined) {
-  return createMcpHandler(createTodoMcpServer, {
+  return createMcpHandler(createTodoMcpServer(TEST_DEPS), {
     route: "/mcp",
     ...(props ? { authContext: { props } } : {}),
   });
@@ -69,10 +80,20 @@ async function call(
 }
 
 describe("mcp handler", () => {
-  it("exposes whoami", async () => {
+  it("exposes whoami alongside the toolset v1 surface", async () => {
     const result = await call(handlerWithProps(PROPS), "tools/list", {});
     const tools = result.tools as Array<{ name: string }>;
-    expect(tools.map((t) => t.name)).toEqual(["whoami"]);
+    // Sorted so the assertion pins the exact surface without pinning
+    // registration order. Deliberately absent: any delete tool — cancelling is
+    // a status, not a row removal (ticket 03).
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      "complete_task",
+      "get_agenda",
+      "get_task",
+      "search_tasks",
+      "upsert_task",
+      "whoami",
+    ]);
   });
 
   it("returns the authenticated identity from props", async () => {
@@ -103,7 +124,7 @@ describe("mcp handler", () => {
   // calling the handler positionally (`handler(request, env, ctx)`) instead
   // of through `.fetch(request, options)`.
   it("[production wiring] reads identity from ctx.props when called positionally, not via authContext injection", async () => {
-    const handler = createMcpHandler(createTodoMcpServer, { route: "/mcp" });
+    const handler = createMcpHandler(createTodoMcpServer(TEST_DEPS), { route: "/mcp" });
     const response = await handler(
       buildMcpRequest("tools/call", { name: "whoami", arguments: {} }),
       {},

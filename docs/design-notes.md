@@ -48,6 +48,21 @@
   - [scope enforcement] hasRequiredScope — 401 の scope 広告に対応する実体
   - whoami ツールの「到達不能パス」を敢えて残す理由
   - mcpApiHandler を ExportedHandler 形状でラップする理由
+  - [09] env をファクトリに渡す経路がないので deps をカリー化した
+  - [09] Turso 未設定のとき 500 ではなく openDb で投げる理由
+- [packages/core](#packagescore)
+  - [09] core / server の境界をどこで切ったか
+  - [09] user_id スコープを「grep で確認できる」形に保つ
+  - [09] TaskDb を最小インターフェースにして node:sqlite でテストする
+  - [09] 書き込みを全部 RETURNING にした理由と往復回数
+  - [09] COUNT(*) OVER () で総件数と先頭 N 件を 1 往復で取る
+  - [09] 読み出し時に Zod 検証をしない
+- [todo-tools.ts / todo-format.ts](#todo-toolsts--todo-formatts)
+  - [09] user_id を引数から受け取らない構造（withUser）
+  - [09] due だけスキーマ検証にしない理由
+  - [09] ToolText を interface ではなく type にした理由
+  - [09] プロトタイプから変えた点（agenda フッターの文言）
+  - [09] ツール呼び出しログに載せるもの・載せないもの
 - [github.ts](#githubts)
   - GitHub 認可 URL に scope を一切渡さない理由
   - GitHub の token エンドポイントはエラーも HTTP 200 で返す
@@ -370,6 +385,142 @@
 このラッパーはスコープ強制の場所でもある。`OAuthProvider` はこのハンドラを呼ぶ前に grant の props を復号して `ctx.props` に入れる（`index.ts` 参照）ため、`props.scopes` が使える最初のタイミングであり、リクエストがツールに到達する前に検査できる。
 
 **ソース位置**: `mcp.ts` の `mcpApiHandler`
+
+### [09] env をファクトリに渡す経路がないので deps をカリー化した
+
+**問題**: Turso の接続情報は Worker の `env`（`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`）にしかない。しかし `agents/mcp/server` の stateless ハンドラは `env` をサーバーファクトリに一切渡さない。実装を読むと `callable = (request, _env, ctx) => serve(request, void 0, ctx)` となっており、ファクトリが受け取る `McpRequestContext` は `era` / `authInfo` / `requestInfo` の 3 つだけ（`agents/dist/handler-stateless-*.js` と `@modelcontextprotocol/server` の型定義で確認）。つまり 08 の「モジュールスコープで 1 回だけハンドラを作る」形のままでは、ツールから DB 設定に手が届かない。
+
+**検討した選択肢**:
+
+1. **モジュールスコープの可変変数に env を退避する**: `mcpApiHandler.fetch` の冒頭で `currentEnv = env` と書き、ファクトリから読む。差分は最小だが、リクエスト間で共有される可変状態が増える。同一 isolate 内で `env` は常に同じオブジェクトなので実害が出る確率は低いが、「なぜ安全なのか」がコードから読み取れない（暗黙の前提に依存する）。テストからも書き換えが必要になる。
+2. **deps をクロージャで閉じ、ハンドラをリクエストごとに組み立てる**: `createTodoMcpServer(deps)` がファクトリを返す形にし、`mcpApiHandler.fetch` の中で `createMcpHandler(...)` を呼ぶ。共有される可変状態はゼロ。
+
+**判断軸と結論**: ①共有可変状態の有無 ②テストからの注入しやすさ ③リクエストあたりのコスト。①②で 2 が勝ち、③ は「そもそも `McpServer` 自体がリクエストごとに作られる（stateless 設計の前提）」ので、その上に薄いハンドララッパーが 1 つ増えても誤差。2 を採った。
+
+**波及**: `createTodoMcpServer` の呼び出し側（`test/mcp.test.ts` の 4 箇所）が `createTodoMcpServer(TEST_DEPS)` になった。既存テストは削除も無効化もしていない。
+
+**ソース位置**: `mcp.ts` の `createTodoMcpServer` / `mcpApiHandler`
+
+### [09] Turso 未設定のとき 500 ではなく openDb で投げる理由
+
+**問題**: `TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN` が欠けたデプロイをどう扱うか。黙って空の結果を返すのは論外（モデルが「タスクは 0 件です」と人間に報告してしまい、設定ミスが観測できない）。
+
+**検討した選択肢**: ①`mcpApiHandler` で 500 を返してリクエストごと落とす ②`openDb()` の呼び出し時に例外を投げる。
+
+**判断**: ② を採った。① だと `initialize` / `tools/list` / `whoami` まで落ちる。`whoami` は「サーバーが自分を誰だと思っているか」を確認するための診断ツールで、設定ミスの調査でまさに使いたい道具。② なら DB に触るツールだけが失敗する。SDK はツールハンドラ内の例外を `isError` のツール結果に変換する（`mcp-*.mjs` の `tools/call` ハンドラが `createToolError(error.message)` を呼ぶ）ので、こちらが書いた日本語のメッセージがそのままモデルに届く。
+
+**ソース位置**: `mcp.ts` の `tursoOpener()`、`turso.ts` の `tursoConfigFromEnv()`
+
+---
+
+## packages/core
+
+### [09] core / server の境界をどこで切ったか
+
+**方針**: core に入れるのは「MCP サーバーと CLI（チケット 11）で同一でなければならないもの」だけ。
+
+- **core**: workspace / status の Zod enum、`Task` 型、Turso クライアント生成、tasks への SQL 全部、時刻（保存フォーマットと「今日」の JST 境界）
+- **server**: ツール定義、tool description、行形式 `#id [status] title (due) {project} +memo` の整形、エラー文の組み立て
+
+**なぜこの線**: 表示は「誰に読ませるか」で形が変わる。MCP の応答はモデルに読ませる中間表現で、実会話の観察（07）ではモデルがそれを人間向けの Markdown テーブルに再整形していた。CLI は端末で人間が直接読む。共有すると両方が歪む。逆に「今日」の境界を共有しないと、同じタスクが MCP では期限切れ・CLI ではまだ間に合う、という食い違いが起きる。
+
+**upsert の扱い**: core には `createTask` / `updateTask` の 2 本を置き、「id があれば更新・無ければ作成」の分岐は server 側に残した。`title` の必須性が 2 つのケースで違い（作成では必須、更新では任意）、その必須性違反を伝えるエラー文が MCP 固有だから。SQL はすべて core にある、という本来の要件は満たしている。
+
+### [09] user_id スコープを「grep で確認できる」形に保つ
+
+**問題**: 全クエリに user_id 条件を入れる、という規律は書き忘れれば破れる。破れたときの結果は「他人のタスクが見える／書き換わる」で、静かに起きる。
+
+**対応**: ①SQL を `packages/core/src/tasks.ts` の 1 ファイルに閉じ込める（server 側に生 SQL を書かない）②SELECT / UPDATE は `WHERE user_id = ?` を**リテラルとして**SQL 文字列に持たせる ③INSERT は列リストの先頭に user_id を書く。この形なら、テンプレートリテラルを機械的に抜き出して user_id の有無を判定できる。
+
+**実際に見つかった穴**: 最初の実装では `searchTasks` だけが `conditions` 配列を `join(" AND ")` する形で、`user_id = ?` も配列の 1 要素だった。機械チェックにかけると、この 1 文だけが「user_id 条件なし」と判定された（実行時には正しく効いていた）。条件の並べ替え 1 つで静かにスコープが外れうる形でもあったため、固定部分 `WHERE user_id = ? AND workspace = ?` をリテラルに戻し、可変の絞り込みだけを ` AND ...` として連結する形に直した。**チェックのために書き方を変えたのではなく、チェックが本物の脆さを指した。**
+
+**ソース位置**: `packages/core/src/tasks.ts` 全体、特に `searchTasks()`
+
+### [09] TaskDb を最小インターフェースにして node:sqlite でテストする
+
+**問題**: クエリ関数のテストで守りたいのは「関数が期待どおりの SQL 文字列を組み立てたか」ではなく「その SQL が他人の行を 1 行も返さない・書き換えないか」。SQL 文字列を突き合わせるモックでは、WHERE 句の抜けを検出できない（モックは書かれたとおりに答えるだけ）。
+
+**対応**: core が要求する DB 面を `all()` / `get()` の 2 メソッドだけに絞り、`@tursodatabase/serverless` の `Connection` がそのまま構造的に満たす形にした。テストは同じ形を `node:sqlite`（Node 22 に同梱、in-memory）で実装して渡す。DDL は `packages/core/schema.sql` を読み込むので、Turso に流したのと同じスキーマに対して本物の SQLite が SQL を実行する。
+
+**副次的な制約**: `node:sqlite` の型は `@types/node` から来るため、この import は core の test ディレクトリに閉じ込めてある。server 側の tsconfig は `types: ["@cloudflare/workers-types"]` で node 型を持たない（両者を同じプログラムに混ぜるとグローバルが衝突する）ので、server のテストからは in-memory DB を使えない。ツール層の実挙動は `wrangler dev` + 実 Turso のスモークテストで確認する、という分担にしている。
+
+**ソース位置**: `packages/core/src/db.ts` の `TaskDb`、`packages/core/test/support/sqlite-task-db.ts`
+
+### [09] 書き込みを全部 RETURNING にした理由と往復回数
+
+**問題**: Workers から Turso への 1 クエリは 1 回の HTTPS 往復。INSERT / UPDATE のあとに書いた行を読み直すと、それだけで往復が倍になる。
+
+**対応**: `INSERT ... RETURNING` / `UPDATE ... RETURNING` を使い、書いた行をその場で受け取る。結果として `TaskDb` に `run()` が不要になり、面が `all()` / `get()` の 2 つに減った。
+
+**現在の往復回数**: 作成 1 / 更新 2（現在値の SELECT → UPDATE）/ 完了 2（同）/ 一覧・検索・詳細 各 1。更新系が 2 なのは、応答に「実際に変わった列」を出すために変更前の値が要るから。この差分表示は、AI が同じ更新を繰り返したときに人間が気付ける唯一の手掛かりなので、1 往復と引き換えに残している。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `createTask()` / `updateTask()` / `completeTask()`
+
+### [09] COUNT(*) OVER () で総件数と先頭 N 件を 1 往復で取る
+
+**問題**: `search_tasks` の応答は「該当 N 件」と「先頭 20 件」の両方を必要とする（超過分は件数だけ示して絞り込みに誘導する、が 07 で確定した形）。素直に書くと COUNT 用と本体用で 2 クエリ＝2 往復になり、その間に件数と中身がずれる余地も生まれる。
+
+**対応**: ウィンドウ関数 `COUNT(*) OVER () AS total_count` を SELECT に混ぜ、`LIMIT` で打ち切る。ウィンドウ関数は LIMIT より前に評価されるので、打ち切っても total は全件数のまま。Turso 上で実際に動くことを事前に確認した（合成行 2 件・`LIMIT 1` で `total_count = 2`）。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `searchTasks()`
+
+### [09] 読み出し時に Zod 検証をしない
+
+**問題**: DB 側に CHECK 制約がない（チケット 03 の決定 —— 値を変えるたびにテーブル再作成が要るため）。したがって理屈の上では、手で書き換えた行などで status が未知の値になりうる。
+
+**対応**: `taskFromRow()` は Zod を通さず、素の型付きマッパーにしてある。1 行の不正値のために一覧全体が例外で落ちる代償のほうが大きい。検証は「書き込みの入口」に置く、が 03 の設計であり、入口は MCP と CLI の 2 つだけで、どちらもこのパッケージの Zod enum を通る。
+
+**ソース位置**: `packages/core/src/schema.ts` の `taskFromRow()`
+
+---
+
+## todo-tools.ts / todo-format.ts
+
+### [09] user_id を引数から受け取らない構造（withUser）
+
+**問題**: user_id をツール引数にすると、モデルが別の値を渡した瞬間に他人のタスクへ到達できる。出どころは OAuth の grant に封じた props ただ 1 つでなければならない。
+
+**対応**: 入力スキーマに user_id を一切置かない。さらに全ツールハンドラを `withUser()` で包み、第 1 引数として userId を渡す形にした。これにより「user_id を解決し忘れたハンドラ」は型が合わず書けない。認証コンテキストを読むのはこの 1 箇所だけで、core 側のクエリ関数は `getMcpAuthContext()` を一切知らない（userId は必ず引数で来る）。
+
+**ソース位置**: `todo-tools.ts` の `currentUserId()` / `withUser()`
+
+### [09] due だけスキーマ検証にしない理由
+
+**説明**: 06 で確定したエラー文は 3 部品（①不正値のエコー ②期待する形式 ③モデルが機械計算できるアンカー）。due の ③ は「今日の日付」で、これがないとモデルは「明日」を絶対日付に直せない。Zod スキーマ側で弾くと SDK 自動生成の文言（`Input validation error: ... expected ...`）になり、今日を注入する余地がない。そのため due だけはスキーマを `z.string()` に緩め、ハンドラ内で `isCalendarDate()` を使って検証している。
+
+**実測**: 未知の workspace 値（`"private"`）を渡すと、SDK が `Input validation error: Invalid arguments for tool get_agenda: workspace: Invalid option: expected one of "work"|"life"` を `isError` で返した（07 の「スキーマ違反は JSON-RPC error ではなく isError」の再確認）。この文言は enum なら十分だが、日付には足りない。
+
+**ソース位置**: `todo-tools.ts` の `upsert_task` ハンドラ、`todo-format.ts` の `invalidDueError()`
+
+### [09] ToolText を interface ではなく type にした理由
+
+**問題**: ツール応答の形を `interface ToolText` として定義したところ、`registerTool` に渡すハンドラが型エラーになった（`Type 'ToolText' is not assignable to ... Property 'resultType' is missing`）。
+
+**原因**: SDK 側の戻り値型は `[x: string]: unknown` のインデックスシグネチャを持つ。TypeScript は **type エイリアス**には暗黙のインデックスシグネチャを与えるが、**interface** には与えない（interface は宣言マージで後から拡張されうるため）。
+
+**対応**: `ToolText` を `type` エイリアスに変えた。
+
+**ソース位置**: `todo-format.ts` の `ToolText`
+
+### [09] プロトタイプから変えた点（agenda フッターの文言）
+
+**問題**: プロトタイプの agenda フッターは、セクションに出なかった残りを「someday N 件・**期限なし todo** M 件」と表現していた。しかし実際の M には「期限が 8 日以上先のタスク」も入る（どのセクションの条件にも当たらないため）。プロトタイプのシードには遠い将来の期限を持つタスクが無く、観察では顕在化しなかった。
+
+**対応**: 「someday N 件・**期限なし or 7日より先** M 件」に直した。読み手はモデルであり、件数の説明が実態と食い違うと、そのまま人間への報告に乗る。
+
+**実測**: スモークテストで #3 の期限を 8/20（今日から 12 日先）に動かしたところ、まさにこの分岐に入り `_他に open 1 件（someday 0 件・期限なし or 7日より先 1 件）は含まれていない。_` と表示された。
+
+**ソース位置**: `todo-format.ts` の `buildAgenda()`
+
+### [09] ツール呼び出しログに載せるもの・載せないもの
+
+**背景**: 07 の観察では `[observe]` ログにセッション識別子がなく、呼び出し 3 件の出どころを確定できないまま記録に残った（同チケットの「反省」）。
+
+**対応**: `[todo]` の 1 行 JSON ログに、リクエストヘッダ由来の識別子（`mcp-session-id`、無ければ Cloudflare の `cf-ray`）を `req` として載せる。
+
+**載せないもの**: `title` と `memo`。個人のタスク本文が Workers のログに残るのを避ける。載せるのはツール名・解決後の workspace・id・結果の種別（作成/更新/変更列名/not_found など）だけで、これで「どのツールがどう呼ばれたか」は追える。
+
+**ソース位置**: `mcp.ts` の `resolveRequestId()`、`todo-tools.ts` の `log()`
 
 ---
 

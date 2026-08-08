@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["es2022"],
+    // core 自体は Workers 専用ではない（CLI = チケット 11 からも同じコードを使う）ので
+    // @cloudflare/workers-types は入れない。node 型が要るのは test/ 側だけ
+    // （node:sqlite で本物の SQLite を相手にクエリ関数を検証するため）。
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true
+  },
+  "include": ["src", "test", "vitest.config.ts"]
+}

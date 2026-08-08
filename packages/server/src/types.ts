@@ -24,6 +24,13 @@ export interface Env {
    */
   ALLOWED_GITHUB_USERS?: string;
 
+  /**
+   * Turso の接続先。dev（`todo-mcp-dev`）と本番（`todo-mcp-prod`）で別の DB を指す。
+   * 欠けている場合は 500 で落とす（理由は turso.ts）。
+   */
+  TURSO_DATABASE_URL?: string;
+  TURSO_AUTH_TOKEN?: string;
+
   /** ハンドラ呼び出し前に OAuthProvider が注入する。 */
   OAUTH_PROVIDER: OAuthHelpers;
 }

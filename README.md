@@ -2,22 +2,62 @@
 
 実用的な Todo MCP サーバー。Turso + GitHub OAuth + ワークスペース切り替え。MCP spec 2026-07-28 / SDK v2 上に構築。
 
-現在の状態: **認証つきデプロイのスケルトン**。認可まわりの構造は本番想定で作り込んであるが、
-ツール面は `whoami` 1本のみ。Turso と本来の todo ツールは後続チケットで追加する。
+現在の状態: **認証つきサーバー + Todo ツール本実装**。ツールセット v1（5 ツール + Resource /
+Prompt 各 1）が Turso 上で動く。旧 `todos.db` からのデータ移行と `packages/cli` は後続チケット。
 
 ## 構成
 
 ```
+packages/core/       MCP サーバーと CLI で共有するドメイン層（Cloudflare 非依存）
+  schema.sql         tasks テーブルの確定 DDL（Turso への適用元）
+  src/schema.ts      workspace / status の Zod enum、Task 型、行マッパー
+  src/tasks.ts       tasks への SQL 全部（list / get / create / update / complete / search）
+  src/db.ts          Turso クライアント生成と、クエリが要求する最小の DB 面（TaskDb）
+  src/time.ts        保存フォーマット（ISO 8601 UTC）と「今日」の JST 境界
+
 packages/server/     Cloudflare Worker: MCP サーバー（Resource Server）+ OAuth AS
   src/index.ts       エントリーポイント — Origin ガード、OAuthProvider の配線
   src/github-handler.ts  同意ダイアログ、GitHub へのリダイレクト、コールバック、許可リスト適用
-  src/mcp.ts         SDK v2 McpServer + `whoami`
+  src/mcp.ts         SDK v2 McpServer + `whoami` + Turso 接続の組み立て
+  src/todo-tools.ts  Todo ツール 5 本 + Resource + Prompt の定義と description
+  src/todo-format.ts モデルに読ませる本文・エラー文の組み立て
+  src/turso.ts       env から Turso 接続設定を取り出す
   src/allowlist.ts   純粋な認可ヘルパー関数（ユニットテスト済み）
   src/approval.ts    同意ダイアログ、CSRF、OAuth state のバインディング
   src/redirect-uri.ts  DCR登録と GET /authorize で共有する redirect_uri ポリシー
 ```
 
-npm workspaces のモノレポ構成。`packages/core` と `packages/cli` は後日追加予定。
+npm workspaces のモノレポ構成。`packages/cli` は後日追加予定。
+
+## ツール
+
+| ツール | 引数 | 用途 |
+|---|---|---|
+| `get_agenda` | `workspace?` | 今日の行動対象（期限切れ / 今日 / 7日以内 / 進行中 / 待ち） |
+| `get_task` | `id` | 1 件の全詳細（memo 本文を含む） |
+| `upsert_task` | `id?, title?, workspace?, project?, status?, due?, memo?` | 作成 / 部分更新。`status: "cancelled"` がソフトデリート |
+| `complete_task` | `id` | done にする（冪等） |
+| `search_tasks` | `query?, workspace?, status?, project?, include_closed?` | 絞り込み一覧（既定は open のみ、上限 20 件） |
+
+タスクを物理削除するツールは存在しない。「やらないと決めた」は行の抹消ではなく状態なので
+`cancelled` で表す。
+
+workspace はマシンごとの既定を接続 URL の `?workspace=work|life` で決め、ツール引数が来たら
+そちらが勝つ。タスクは GitHub アイデンティティ（`github:<数値id>`）ごとに完全に分離される。
+
+## Turso
+
+`tasks` テーブルは 1 つだけ。定義は `packages/core/schema.sql`（唯一の正）。
+
+```bash
+turso db create todo-mcp-dev
+turso db shell todo-mcp-dev < packages/core/schema.sql
+turso db tokens create todo-mcp-dev     # 出力を .dev.vars の TURSO_AUTH_TOKEN へ
+turso db show todo-mcp-dev --url        # 出力を .dev.vars の TURSO_DATABASE_URL へ
+```
+
+開発用（`todo-mcp-dev`）と本番用（`todo-mcp-prod`）で DB を分けている。本番 URL は既に複数の
+マシンから実運用されているため、開発中の書き込みで汚さないための分離。
 
 ## 認可の仕組み
 
@@ -67,7 +107,12 @@ GITHUB_CLIENT_ID=<dev app client id>
 GITHUB_CLIENT_SECRET=<dev app client secret>
 COOKIE_ENCRYPTION_KEY=<openssl rand -base64 32>
 ALLOWED_GITHUB_USERS=<your github login>
+TURSO_DATABASE_URL=libsql://todo-mcp-dev-<org>.<region>.turso.io
+TURSO_AUTH_TOKEN=<turso db tokens create todo-mcp-dev の出力>
 ```
+
+Turso の 2 つが未設定でも起動はするが、DB に触るツールだけが「サーバー設定エラー」を返す
+（`whoami` と `tools/list` は生きたままにしてある——設定ミスの診断に使うため）。
 
 `ALLOWED_GITHUB_USERS` はフェイルクローズ設計——未設定または空なら全員拒否になる。値は GitHub の
 ログイン名（`octocat`）、またはログイン改名後に別人が空いた名前を再登録しても追跡できるよう、
@@ -119,7 +164,7 @@ Chrome と Firefox での動作を確認済み。Safari は未検証。
    返ってきた id を `packages/server/wrangler.jsonc` の `kv_namespaces[0].id` に入れる
    （現在はプレースホルダーの `REPLACE_ME_BEFORE_DEPLOY` が入っている）。
 
-3. **シークレット** — 4つとも `wrangler.jsonc` には書かない:
+3. **シークレット** — 6つとも `wrangler.jsonc` には書かない:
 
    ```bash
    cd packages/server
@@ -127,10 +172,15 @@ Chrome と Firefox での動作を確認済み。Safari は未検証。
    npx wrangler secret put GITHUB_CLIENT_SECRET
    npx wrangler secret put COOKIE_ENCRYPTION_KEY   # openssl rand -base64 32
    npx wrangler secret put ALLOWED_GITHUB_USERS    # カンマ区切りのログイン名、または github:<numeric id>
+   npx wrangler secret put TURSO_DATABASE_URL      # turso db show todo-mcp-prod --url
+   npx wrangler secret put TURSO_AUTH_TOKEN        # turso db tokens create todo-mcp-prod
    ```
 
    `ALLOWED_GITHUB_USERS` をあえて `vars` ではなくシークレットにしているのは、同名の `vars`
    エントリがあるとデプロイのたびにシークレットを上書きしてしまうため。
+
+   本番の Turso は **`todo-mcp-prod`**（dev の `todo-mcp-dev` ではない）。ここを間違えると、
+   実運用中のタスクが開発用 DB を向く。
 
 4. **デプロイ**:
 
