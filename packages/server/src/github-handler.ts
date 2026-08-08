@@ -338,6 +338,23 @@ app.get("/callback", async (c) => {
     // 値を使い回す。強制ロジック本体は mcp.ts の hasRequiredScope()。
     const grantedScopes = resolveGrantedScopes(oauthReqInfo.scope, SCOPES_SUPPORTED);
 
+    // [09/複数端末] 既定の revokeExistingGrants（同一 userId+clientId の既存
+    // grant を再認可のたびに全 revoke）を無効化するのは CIMD 経路だけ。
+    //
+    //  - CIMD の client_id はクライアント側のビルド定数で、同じ Claude Code を
+    //    使う限り何台目であろうと同じ値を名乗る。だから既定のままだと「同じ
+    //    client」＝「自分の全端末」になり、1台の再認可が他端末を丸ごと
+    //    ログアウトさせる。ここだけは既定を外す必要がある。
+    //  - DCR / 事前登録クライアントの client_id は登録ごとに発番されるので、
+    //    同じ既定が本来の意味（＝この端末の古いセッションだけを切る）で正しく
+    //    働く。無条件に外すと、必要のない側にまで「古い grant と token が
+    //    最大30日残る」緩和を掛けることになる。
+    //
+    // 詳細は docs/design-notes.md 参照。
+    const registration = registrationSource(oauthReqInfo.clientId);
+    const grantRevocationPolicy =
+      registration === "cimd" ? ({ revokeExistingGrants: false } as const) : {};
+
     const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
       request: { ...oauthReqInfo, resource },
       // コロンなし: provider のトークン形式は `userId:grantId:secret` で
@@ -345,11 +362,7 @@ app.get("/callback", async (c) => {
       userId: githubGrantUserId(identity.id),
       metadata: { label: identity.login },
       scope: grantedScopes,
-      // [09/複数端末] CIMD では client_id が全端末で同一のため、既定の
-      // revokeExistingGrants（同一 userId+clientId の既存 grant を全 revoke）
-      // のままだと1台の再認可が他端末を丸ごとログアウトさせる。詳細は
-      // docs/design-notes.md 参照。
-      revokeExistingGrants: false,
+      ...grantRevocationPolicy,
       props: {
         login: identity.login,
         user_id: githubUserId(identity.id),
@@ -358,7 +371,7 @@ app.get("/callback", async (c) => {
     });
 
     log("callback_completed", {
-      registration: registrationSource(oauthReqInfo.clientId),
+      registration,
       client_id: oauthReqInfo.clientId,
       login: identity.login,
       user_id: githubUserId(identity.id),

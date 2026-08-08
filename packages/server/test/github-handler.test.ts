@@ -464,40 +464,74 @@ describe("GET /callback", () => {
     expect((call?.props as { scopes?: string[] } | undefined)?.scopes).toEqual(["todo"]);
   });
 
-  // [09/複数端末] CIMD の client_id は端末を問わず同一なので、provider の既定
-  // （同一 userId+clientId の既存 grant を再認可のたびに全 revoke）のままだと
-  // 1台の再認可が他端末の grant を丸ごと消してしまう。この呼び出しが
-  // revokeExistingGrants: false を伴うことを固定し、その回帰を防ぐ。
-  it("[09/複数端末] calls completeAuthorization with revokeExistingGrants: false", async () => {
-    stubGitHubFetch({ login: "octocat", id: 1 });
+  // [09/複数端末] 認可の緩和は登録経路ごとに非対称でなければならない。CIMD の
+  // client_id はクライアントのビルド定数なので3台が同一クライアントに見え、
+  // provider 既定（同一 userId+clientId の既存 grant を再認可のたびに全 revoke）
+  // のままだと1台の再認可が他端末の grant を丸ごと消す。DCR は登録ごとに
+  // client_id が発番されるので同じ既定が本来の意味で働く。以下の2件は
+  // 「CIMD では外す / DCR では外さない」を両方固定する（片方だけだと、
+  // 無条件に外してしまう退行にも、緩和ごと消す退行にも気づけない）。
+  //
+  // ここは「渡した引数」だけを見るテストで、ライブラリがそのフラグを実際に
+  // 尊重するかは test/oauth-grants.test.ts（実ライブラリ）側で押さえている。
+  describe("[09/複数端末] revokeExistingGrants は CIMD 経路にだけ渡す", () => {
+    /**
+     * allowlist 済みユーザーで /callback を最後まで走らせ、唯一の
+     * completeAuthorization() 呼び出しのオプションを返す。clientId が
+     * ハンドラから見える登録経路（CIMD / 登録済み）を決める。
+     */
+    async function completeAuthorizationOptionsFor(
+      clientId: string,
+    ): Promise<Parameters<OAuthHelpers["completeAuthorization"]>[0]> {
+      stubGitHubFetch({ login: "octocat", id: 1 });
 
-    const kv = kvStub();
-    const { stateToken } = await createOAuthState(BASE_AUTH_REQUEST, kv);
-    await approveOAuthState(stateToken, kv);
-    const { setCookie } = await bindStateToSession(stateToken);
-    const sessionCookiePair = setCookie.split(";")[0]!;
+      const kv = kvStub();
+      const { stateToken } = await createOAuthState({ ...BASE_AUTH_REQUEST, clientId }, kv);
+      await approveOAuthState(stateToken, kv);
+      const { setCookie } = await bindStateToSession(stateToken);
+      const sessionCookiePair = setCookie.split(";")[0]!;
 
-    const completeAuthorization = vi.fn(
-      async (_options: Parameters<OAuthHelpers["completeAuthorization"]>[0]) => ({
-        redirectTo: "https://client.example/callback?code=final-code",
-      }),
-    );
-    const env = makeEnv({
-      kv,
-      allowedUsers: "octocat",
-      provider: oauthProviderStub({ completeAuthorization }),
+      const completeAuthorization = vi.fn(
+        async (_options: Parameters<OAuthHelpers["completeAuthorization"]>[0]) => ({
+          redirectTo: "https://client.example/callback?code=final-code",
+        }),
+      );
+      const env = makeEnv({
+        kv,
+        allowedUsers: "octocat",
+        provider: oauthProviderStub({ completeAuthorization }),
+      });
+
+      const request = new Request(
+        `http://localhost:8788/callback?code=upstream-code&state=${stateToken}`,
+        { headers: { Cookie: sessionCookiePair } },
+      );
+      const response = await GitHubHandler.fetch(request, env, ctxStub);
+
+      expect(response.status).toBe(302);
+      expect(completeAuthorization).toHaveBeenCalledTimes(1);
+      return completeAuthorization.mock.calls[0]![0];
+    }
+
+    it("CIMD クライアントには revokeExistingGrants: false を渡す", async () => {
+      const call = await completeAuthorizationOptionsFor(
+        "https://claude.ai/oauth/claude-code-client-metadata",
+      );
+
+      expect(call.revokeExistingGrants).toBe(false);
     });
 
-    const request = new Request(
-      `http://localhost:8788/callback?code=upstream-code&state=${stateToken}`,
-      { headers: { Cookie: sessionCookiePair } },
-    );
+    it("DCR / 事前登録クライアントには渡さない（provider 既定の revoke を残す）", async () => {
+      // provider の createClient() が発番する形の不透明 ID。URL ではないので
+      // registrationSource() は "registered" を返す。
+      const call = await completeAuthorizationOptionsFor("2f8a1c9b4e7d6a05");
 
-    const response = await GitHubHandler.fetch(request, env, ctxStub);
-
-    expect(response.status).toBe(302);
-    expect(completeAuthorization).toHaveBeenCalledTimes(1);
-    const call = completeAuthorization.mock.calls[0]?.[0];
-    expect(call?.revokeExistingGrants).toBe(false);
+      // `false` でないことではなく「そもそも渡していない」ことを固定する。
+      // provider の分岐は `revokeExistingGrants !== false` なので、
+      // undefined と true は同じ意味になってしまい、値だけを見ていると
+      // 「DCR には true を渡す」実装との区別がつかない。
+      expect(call).not.toHaveProperty("revokeExistingGrants");
+      expect(call.revokeExistingGrants).toBeUndefined();
+    });
   });
 });

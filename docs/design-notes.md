@@ -38,7 +38,10 @@
   - [GitHub-side denial] GitHub 自身の拒否をアクセス拒否として扱う
   - [P1-2/L-7] audience 補完と resourceMatchOriginOnly の対応
   - [scope enforcement] grantedScopes を一度だけ計算し、grant と props の両方に使う
-  - [09/複数端末] completeAuthorization() に revokeExistingGrants: false を渡す
+  - [09/複数端末] revokeExistingGrants の無効化は CIMD 経路にだけ掛ける
+  - [09/複数端末] 端末を失くしたときに実際に打てる kill switch は KV の grant 削除
+  - [09/複数端末] grant の30日は認可時点からの絶対値で、refresh では延びない
+  - [09/複数端末] purgeExpiredData を cron で回す必要がない理由
 - [index.ts](#indexts)
   - [M-4] DCR 登録の有効期限を 7日 から 90日（provider 既定値）に戻した経緯
   - allowPlainPKCE を false にする理由
@@ -343,22 +346,82 @@
 
 **ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ（強制ロジック本体は `mcp.ts` の `hasRequiredScope()`）
 
-### [09/複数端末] completeAuthorization() に revokeExistingGrants: false を渡す
+### [09/複数端末] revokeExistingGrants の無効化は CIMD 経路にだけ掛ける
 
 **問題**: `@cloudflare/workers-oauth-provider@0.8.3` の `completeAuthorization()` は、`revokeExistingGrants` が明示的に `false` でない限り、同じ `(userId, clientId)` の既存 grant を全て revoke する（`dist/oauth-provider.js`: `revokeExistingGrants !== false` の分岐 → `grant.clientId === clientId` だけで収集 → `revokeGrant()`）。CIMD（Client ID Metadata Document）では `client_id` はクライアント側のビルド定数で、Claude Code は端末を問わず同じ `client_id`（`https://claude.ai/oauth/claude-code-client-metadata`）を名乗る。松本さんの3台のマシンが同じ GitHub アカウントで認可すると `userId` も `clientId` も揃うため、1台が再認可するたびに他2台の grant が丸ごと消え、access token は 401 `invalid_token`、refresh token は 400 `invalid_grant` になっていた。
 
-**対応**: `completeAuthorization()` の呼び出しに `revokeExistingGrants: false` を明示する。
+**対応**: `registrationSource(clientId) === "cimd"` のときだけ `revokeExistingGrants: false` を渡す。DCR / 事前登録クライアントには**渡さない**（provider 既定の revoke が効いたまま）。
 
-**なぜ既定値がここでは害になるか**: この既定（再認可時に同一 user+client の既存 grant を revoke する）は DCR（Dynamic Client Registration）を前提にした設計で、端末ごとに個別の `client_id` が発番されていた頃は「この端末の古いセッションだけを切る」ことを意味していた。CIMD では `client_id` がクライアント実装単位（＝ Claude Code というアプリそのもの）に固定されるため、同じコードが「自分の他の端末を全部ログアウトさせる」に化ける。
+**なぜ CIMD だけなのか**: この既定（再認可時に同一 user+client の既存 grant を revoke する）は DCR（Dynamic Client Registration）を前提にした設計で、`client_id` が登録ごとに発番される限り「この端末の古いセッションだけを切る」という本来の意味で正しく働く。CIMD では `client_id` がクライアント実装単位（＝ Claude Code というアプリそのもの）に固定されるため、同じコードが「自分の他の端末を全部ログアウトさせる」に化ける。壊れているのは CIMD 側だけなので、緩和も CIMD 側だけに掛ける。無条件に外すと、DCR クライアントにまで「古い grant と token が最大30日残る」という不要な認可緩和を掛けることになる。
 
-**手放す性質とそれが軽い理由**: 再認可のたびに同一 user+client の古い grant を自動整理する挙動を手放す。ただし:
+**手放す性質とそれが軽い理由**: CIMD クライアントについてだけ、再認可のたびに古い grant を自動整理する挙動を手放す。ただし:
 - Props に GitHub の upstream アクセストークンを持たせていない（本ファイル冒頭 `types.ts` の「Props に GitHub の upstream アクセストークンを持たせない」参照）ため、この既定が本来防ぎたい「古い upstream トークンが残り続ける」問題自体が起きない。持っていないトークンは漏洩しようがない
-- 個別の grant を明示的に無効化したい場合は RFC 7009 の個別 revoke（`revokeGrant()`）が引き続き使える
-- 使われない grant も無期限には残らない。`index.ts` で `refreshTokenTTL` を上書きしていないため provider 既定の 720 時間（30日）で自然失効する
+- 放置された grant も無期限には残らない（30日の絶対 TTL。下の「grant の30日は認可時点からの絶対値」項）
+- 明示的に切りたい場合の手段は下の「端末を失くしたときに実際に打てる kill switch」項にまとめた。**ここに RFC 7009 だけを書くのは誤り**だったので分離した
 
 **上流のその後**: `@cloudflare/workers-oauth-provider` v0.10.2 でもこの挙動・既定値は同じままで、ticket 13（v0.10.2 追従）でライブラリを上げても本項の対応は不要にならない。`revokeExistingGrants` は 0.3.0 の PR #144 で「同一 user+client の再認可ループ対策」として意図的に導入されたオプションで、CHANGELOG 自身が「複数端末で同時に concurrent grant を持たせたい場合は `revokeExistingGrants: false` を設定せよ」と明示している。つまりこれは修正待ちのバグではなく、ライブラリ側が用意した opt-out を呼び出し側が明示していなかっただけであり、バージョンを上げれば消える性質のものではない。
 
-**ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ、`completeAuthorization()` 呼び出し
+**テスト**: 2層に分かれている。どちらか片方だけでは足りない。
+- `test/github-handler.test.ts` の「revokeExistingGrants は CIMD 経路にだけ渡す」— ハンドラが**登録経路で分岐している**ことを固定する。CIMD で `false`、DCR で**プロパティごと不在**（`false` でないこと、ではない。provider の分岐は `revokeExistingGrants !== false` なので `undefined` と `true` は同義になり、値だけ見ていると区別できない）
+- `test/oauth-grants.test.ts` — `@cloudflare/workers-oauth-provider` の**実体**を動かし、「ライブラリがこのフラグを尊重する」ことを確かめる。渡した引数だけを見るテストは、ライブラリがフラグを無視するようになっても通ってしまう（プロパティの*改名*は型が捕まえるが、*意味の変更*は捕まえない）。ticket 13 で効くのはこちら。node プールで実ライブラリを動かすのに要った仕掛け（`cloudflare:workers` の仮想モジュール差し替えと `server.deps.inline`）は `packages/server/vitest.config.ts` に理由付きで書いてある
+
+**ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ、`completeAuthorization()` 呼び出し直前の `grantRevocationPolicy`
+
+### [09/複数端末] 端末を失くしたときに実際に打てる kill switch は KV の grant 削除
+
+上の緩和で手放したのは「再認可が古い grant を掃除してくれる」性質なので、「じゃあ端末を失くしたら何を打てばいいのか」に答えが要る。**結論から言うと、打てるのは KV の grant キー削除だけ**。以下の2つは代わりにならない。
+
+**RFC 7009 の個別 revoke は「失くした端末の refresh token」を要求する**。provider の revocation endpoint は token endpoint と同じ `/token`（`revocation_endpoint: tokenEndpoint`、`!body.grant_type && !!body.token` で分岐）で確かに動くが、`revokeToken()` は `body.token` から `userId:grantId:secret` を取り出し、`revokeRefreshIfOwned()` が `grantData.refreshTokenId === tokenId`（または `previousRefreshTokenId`）で照合する。つまり**対象マシンの refresh token を手元に持っていないと、その grant は revoke できない**。端末を紛失したというまさに revoke が要る場面では、その token は失った端末の中にある。「代わりに RFC 7009 がある」は、失われた当のものを要求している。
+
+**`ALLOWED_GITHUB_USERS` からユーザーを外しても、生きている grant は切れない**。`isGitHubUserAllowed()` の呼び出しは `github-handler.ts` の `GET /callback` の1箇所だけで、`/mcp` へのリクエストごとの再チェックは無い。allowlist は「新しく grant を作らせない」ゲートであって、既存トークンの無効化ではない。これは今回の変更が作った性質ではなく元からそうだが、「代わりの手段」を考えるときの前提になるのでここに残す。
+
+**実際の手順**（`packages/server` で実行。namespace は `wrangler.jsonc` の `OAUTH_KV` バインディング）:
+
+```sh
+# 1) 生きている grant を列挙する（grant:<userId>:<grantId>）
+npx wrangler kv key list --binding OAUTH_KV --prefix "grant:" --remote
+
+# 2) 消す grant を選ぶ。どれがどの端末かは metadata では区別できないので、
+#    expiration（= 認可時刻 + 30日）から「いつ認可した端末か」で当たりを付ける
+#    → 判別が付かないときは全部消す。全端末が再認可すれば済む
+
+# 3) 先に access token を消す。順序が逆だと穴が空く:
+#    /mcp の検証（handleApiRequest）は token レコードだけを読み、grant:
+#    キーを一切参照しない。grant だけ消しても未失効の access token は
+#    最長1時間（accessTokenTTL 既定 3600 秒）そのまま通ってしまう。
+#    provider 自身の revokeGrant() も token → grant の順で消している。
+npx wrangler kv key list --binding OAUTH_KV --prefix "token:<userId>:<grantId>:" --remote
+npx wrangler kv key delete "token:<userId>:<grantId>:<tokenId>" --binding OAUTH_KV --remote
+
+# 4) grant 本体を消す（以後その端末の refresh は invalid_grant になる）
+npx wrangler kv key delete "grant:<userId>:<grantId>" --binding OAUTH_KV --remote
+```
+
+**何もしなくても最長30日で失効する**（次項）。緊急でなければ待つのも選択肢。
+
+**ソース位置**: 記録のみ（コード変更なし）。根拠は `dist/oauth-provider.js` の `revokeToken` / `revokeRefreshIfOwned`、`github-handler.ts` の `isGitHubUserAllowed()` 呼び出し1箇所
+
+### [09/複数端末] grant の30日は認可時点からの絶対値で、refresh では延びない
+
+**誤解しやすい点**: 「provider 既定の 720 時間（30日）で自然失効する」とだけ書くと、使い続ければ延びる（スライディング）ように読める。**延びない。**
+
+- 認可コード交換時に一度だけ `grantData.expiresAt = now + refreshTokenTTL`（`refreshTokenTTL` は未指定なので既定 `720 * 60 * 60`）が入る
+- `handleRefreshTokenGrant()` は `refreshTokenId` / `previousRefreshTokenId` を回転させて `saveGrantWithTTL()` で書き戻すが、**`expiresAt` を再代入しない**。KV 側も `{ expiration: grantData.expiresAt }` という絶対時刻で書かれる
+- したがって refresh を何度繰り返しても期限は動かず、30日で `invalid_grant`（"Refresh token has expired"）になる
+
+**帰結**: **各マシンが月に1回ほど認可し直す必要がある**。そして今回の修正の眼目は、その再認可が**端末ごとに独立して起きる**（1台の再認可が他端末を巻き込まない）ようにしたことにある。これを書いておかないと、30日後に出る 401/`invalid_grant` が今回の不具合の再発に見える。
+
+**実測**（2026-08-08、本番 KV の read-only 確認）: 生きている grant は1本だけで、`expiration` は認可時刻のちょうど720時間後だった。1本しか無いこと自体が、修正前の「再認可のたびに他端末の grant が消える」症状とも整合する。
+
+**ソース位置**: 記録のみ（コード変更なし）。根拠は `dist/oauth-provider.js` の `handleRefreshTokenGrant` / `saveGrantWithTTL` / `DEFAULT_REFRESH_TOKEN_TTL`
+
+### [09/複数端末] purgeExpiredData を cron で回す必要がない理由
+
+grant も token も KV の expiration 付きで書かれるので、期限が来れば KV 自身が消す。`purgeExpiredData()` が拾うのは**孤児**（client レコードが消えた grant / grant が消えた token）だけで、しかも**CIMD の grant は孤児掃除の対象から明示的に除外されている**（`!this.provider.isClientMetadataUrl(grantData.clientId)`）。CIMD には `client:<id>` レコードがそもそも存在しない（利用のたびにメタデータ文書を取り直す）ので、除外しないと全部孤児に見えてしまうためである。
+
+このサーバの grant は事実上すべて CIMD 由来なので、cron を足しても掃除対象はほぼ空。**scheduled ハンドラは意図的に配線していない**。次に読む人が同じ検討を再走しないようにここに残す。
+
+**ソース位置**: 記録のみ（コード変更なし）。根拠は `dist/oauth-provider.js` の `purgeExpiredData`（`purgeOrphanedGrants` 分岐）
 
 ---
 
