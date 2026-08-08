@@ -60,7 +60,10 @@
   - [09] COUNT(*) OVER () で総件数と先頭 N 件を 1 往復で取る
   - [09] 読み出し時に Zod 検証をしない
   - [09/レビュー] completeTask の冪等性を UPDATE の WHERE 句自体で守る（同時実行対策）
+  - [09/レビュー2] completeTask の応答は返す行の status と一致させる（reopened の追加）
+  - [09/レビュー2] project / memo の空文字を null に正規化する（書けるが読めない値を作らない）
   - [09/レビュー] updateTask の SELECT→UPDATE は非トランザクション —— 許容している理由
+  - [09/レビュー2] 同時実行テストが依存するハーネスの性質を固定する
 - [todo-tools.ts / todo-format.ts](#todo-toolsts--todo-formatts)
   - [09] user_id を引数から受け取らない構造（withUser）
   - [09] due だけスキーマ検証にしない理由
@@ -68,9 +71,14 @@
   - [09] プロトタイプから変えた点（agenda フッターの文言）
   - [09] ツール呼び出しログに載せるもの・載せないもの
   - [09/レビュー] upsert_task の not-found アンカーを workspace で絞らない
+  - [09/レビュー2] not-found アンカーと CAP 20 の相互作用（既知の限界）
   - [09/レビュー] search_tasks の 0 件時のスコープ表示を実効検索条件に合わせる
-  - [09/レビュー] title / project / query の空文字をスキーマ側で弾く
+  - [09/レビュー] title / project / query の空文字をスキーマ側で弾く → [09/レビュー2] で撤回
+  - [09/レビュー2] エラー文にエコーする外部由来の値を無害化する（規約側で塞ぐ）
+  - [09/レビュー2] workspace エラーの③（回復手順）はツールとリソースで共有しない
+  - [09/レビュー2] workspaceMissingError の引数を必須にする
   - [09/レビュー] 表示層・ツール層に DB 不要の単体テストを追加した
+  - [09/レビュー2] fakeTaskDb を SQL 分岐型に一般化し、直した振る舞いに回帰検知を付けた
 - [github.ts](#githubts)
   - GitHub 認可 URL に scope を一切渡さない理由
   - GitHub の token エンドポイントはエラーも HTTP 200 で返す
@@ -508,7 +516,35 @@
 
 **検証**: `packages/core/test/tasks.test.ts` に、`Promise.all` で同じ id への 2 本の completeTask を並べて走らせるテストを追加した。テストが使う node:sqlite 版 TaskDb は `db.all()`/`db.get()` の中身が同期実行を `Promise.resolve()` で包んだだけなので、`Promise.all` の評価順によって「両方の UPDATE が、どちらの結果も読まれるより先に逐次実行される」形に決定的になり、read-then-write レースをこの in-memory DB 上で再現できる。旧実装（SELECT→UPDATE）でこのテストを走らせると、両方が `alreadyDone: false` を返し（「今回完了した」の件数が 1 本ではなく 2 本になる）、想定と食い違って落ちることを確認した。
 
+**識別子の変更（[09/レビュー2]）**: この項に出てくる `alreadyDone: boolean` は現存しない。次項で `outcome: "completed" | "already_done" | "reopened"` に置き換えた（`alreadyDone: false` → `outcome: "completed"`、`alreadyDone: true` → `outcome: "already_done"`）。ここの記述は当時の実装の説明として残してある。
+
 **ソース位置**: `packages/core/src/tasks.ts` の `completeTask()`。テストは `packages/core/test/tasks.test.ts`
+
+### [09/レビュー2] completeTask の応答は返す行の status と一致させる（reopened の追加）
+
+**問題**: 上の修正で `alreadyDone` の判定は「UPDATE が行を返したか」に移ったが、UPDATE が 0 行だったときの読み直し結果の status を確認していなかった（`const current = await getTask(...); return { task: current, alreadyDone: true }`）。コメントには「ここに来た時点で status は既に 'done'」と書いてあったが、これは嘘だった —— UPDATE と読み直しの間（本番では Turso 1 往復）に別マシンが `upsert_task` で done → open に戻すと、読み直した行は done ではない。その行に `alreadyDone: true` が付き、ハンドラは `#1 は既に done です（closed_at: null）。変更なし。` という、同時に返す行の中身と矛盾した本文をモデルに返した（レビューが再現、こちらでも server 経路で再現済み）。
+
+**対応**: `alreadyDone: boolean` を `outcome: "completed" | "already_done" | "reopened"` に置き換えた。boolean は 2 値しか表現できないため、この結末を持てない —— `false` にすれば今度は「完了 ✔」を status=todo の行と一緒に返すことになり、矛盾の向きが変わるだけになる。`outcome` は読み直した行の status から 1 つの式で導出しており（`current.status === "done" ? "already_done" : "reopened"`）、結末と行の中身は構造上ずれない。ハンドラは 3 分岐とも `outcome` だけを見る。
+
+**`reopened` で UPDATE をやり直さない理由**: open に戻した更新のほうが新しい意思表示なので、自動で done に上書きすると、後から来た変更を古い呼び出しが静かに巻き戻す（last-writer-wins の逆転）。事実（done にならなかった）を `isError` で返し、呼び直すかどうかの判断はモデル（と人間）に渡す。応答は 3 部品構成: 何が起きたか / なぜか / 呼び直しか upsert_task で status 明示。
+
+**波及**: `already_done` の応答から `closed_at` が null のときの括弧を落とした。status=done なら closed_at は常に入るが、手で書き換えた行では欠けうるので、`（closed_at: null）` と書くくらいなら出さない。
+
+**検証**: core 側は「UPDATE が 0 行で返った直後・getTask の前に reopen を差し込む」`TaskDb` ラッパーで固定（`packages/core/test/tasks.test.ts` の `[fix-1]`）。server 側は UPDATE が `[]`・再読が status=todo を返す fake で、応答本文が「既に done」とも「完了 ✔」とも言わないことを固定（`packages/server/test/mcp.test.ts` の `[fix-1]`）。`outcome` を無条件 `already_done` に戻す変異で両方落ちることを確認した。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `completeTask()` / `CompleteTaskOutcome`、`packages/server/src/todo-tools.ts` の `complete_task` ハンドラ、`packages/server/src/todo-format.ts` の `completeReopenedError()`
+
+### [09/レビュー2] project / memo の空文字を null に正規化する（書けるが読めない値を作らない）
+
+**問題**: `upsert_task({project: ""})` は通り、`INSERT` の args に `project=""` が入っていた（実測）。しかし `todo-format.ts` の `if (task.project)` は空文字を falsy として落とすので一覧にも詳細にも `{}` が出ず、`tasks.ts` の `if (params.project)` も空文字を無視するので project 絞り込みでは永久にヒットしない。直前の修正で `searchTasksInput.project` にだけ `.min(1)` が入り `upsertTaskInput.project` には入らなかったため、`""` を検索して探すこともできない状態だった。`memo` にも同じ穴がある（`if (task.memo)` が空文字を落とすので `+memo` マーカーが出ない）。つまり**モデルが自力で気付けず復旧もできない不可視の値**が作れた。07 のプロトタイプ観察で見つかった「memo は書けるが読めない」と同じ欠陥クラス。
+
+**対応**: 拒否ではなく正規化を選んだ。`""` を送る意図は実質「消す」なので、往復を強いる意味がない。core の `createTask()` / `updateTask()` で `nullIfEmpty()` を通し、`project` / `memo` の「値なし」の正準表現を null 一つに揃えた。**入口（MCP ハンドラ）ではなく core に置いた**のは、CLI（チケット 11）も同じ書き込み経路を通るため —— 入口ごとに書くと、次の入口で忘れられる。`title` は「消す」を表現できる列ではないので正規化しようがなく、入口で拒否する（次項）。
+
+**波及**: 現在値が null の行に `""` を渡しても `changed` は空のまま（`setIfChanged` の比較が正規化後に走る）。ラベルが付いた行に `""` を渡すと `変更: project` と正直に出て null になる。
+
+**検証**: `packages/core/test/tasks.test.ts` の `[fix-3]` 4 本（作成・更新・no-op・検索から見えること）で、戻り値・`getTask` の読み直し・DB の生の行の 3 段で null を確認。server 側は `[fix-3]` で INSERT / UPDATE のバインド値に `""` が現れないことを固定。ツール経由の実測（実 SQLite）でも `upsert_task({project:"", memo:""})` → `get_task` が `{}`・`+memo` なしで返り、生の行が `{"project":null,"memo":null}` であることを確認した。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `nullIfEmpty()` / `createTask()` / `updateTask()`
 
 ### [09/レビュー] updateTask の SELECT→UPDATE は非トランザクション —— 許容している理由
 
@@ -519,6 +555,18 @@
 **それでも壊れないもの**: status と closed_at は常に同一の UPDATE 文の中で一緒に書かれる（status 専用の分岐が `assignments.push("status = ?", "closed_at = ?")` を同時に積む）。そのため、同時実行があっても「status=done なのに closed_at=null」のような矛盾した中間状態を作ることはできない —— 最終的にどちらが勝っても、勝った側が送った status と closed_at のペアがそのまま反映されるだけ。
 
 **ソース位置**: `packages/core/src/tasks.ts` の `updateTask()`
+
+### [09/レビュー2] 同時実行テストが依存するハーネスの性質を固定する
+
+**問題**: 上の同時実行テスト（`Promise.all` で 2 本の completeTask）は、`createInMemoryTaskDb()` の `all()` が「同期実行を `Promise.resolve()` で包んだだけ」であることに依存している。コメントはそう述べていたが、**その性質を固定するアサーションがどこにも無かった**。ハーネスが将来 `node:sqlite` の非同期 API や実 libsql に差し替わると、このテストは落ちるのではなく**無意味になる** —— インターリーブが変わり、実装が壊れていても winners=1 が偶然成立し続けうる。テストが「守っているつもりで何も守っていない」状態は、テストが無いより悪い（回帰検知があると誤認する）。
+
+**対応**: ①ハーネス側（`sqlite-task-db.ts`）に「この性質に依存しているテストがある」ことを doc コメントで明記し、差し替え時の手順（先に性質のテストが落ちるのを見てから同時実行テストを設計し直す）を書いた。②テスト側に、依存が生きていることを直接確かめるアサーションを置いた —— `completeTask()` を **await せずに**呼び、その時点で行が既に done になっていることを同期読み（`querySync`）で確認する。真に非同期なハーネスではこれが落ちる。
+
+**`querySync` について**: ハーネスにだけ生やしたテスト専用の同期読み口。プロダクションコードは `TaskDb` 型で受け取るので、この口は型から見えない（`InMemoryTaskDb` を知っているのは core の test だけ）。
+
+**検証**: `all()` を `await new Promise(setTimeout)` 経由の実非同期に差し替える変異で、この性質テストが落ちることを確認した。
+
+**ソース位置**: `packages/core/test/support/sqlite-task-db.ts` の `createInMemoryTaskDb()` / `InMemoryTaskDb`、`packages/core/test/tasks.test.ts` の `[fix-7]`
 
 ---
 
@@ -578,6 +626,16 @@
 
 **ソース位置**: `todo-tools.ts` の `upsert_task` ハンドラ（更新経路の not-found 分岐）
 
+### [09/レビュー2] not-found アンカーと CAP 20 の相互作用（既知の限界）
+
+**記録の趣旨**: 上の修正（アンカーを全 workspace から出す）は妥当なので**コードは変えていない**。ただし 2 つの副作用が未記録だったので、ここに残す。
+
+**限界 1 —— CAP 20 は合算後に効く**: `openIdsAnchor()` の `CAP = 20` は、両 workspace の open id を id 昇順で混ぜた**後**に先頭 20 件を切る。したがって片方の workspace に古い（＝小さい id の）open タスクが 20 件以上あると、アンカーがそちらだけで埋まり、モデルが実際に扱っている workspace の id が 1 つも出ないことがありうる。旧 todos.db からの移行（チケット 10）で id 1〜149 が入るので、これは仮想的な話ではない。現状はこの状態でもアンカー末尾の `…他N件` が「まだある」ことを示し、モデルは `search_tasks` に降りられる（`get_task` / `complete_task` の not-found は `include_closed` ヒント付き）。直すなら「workspace ごとに配分して混ぜる」か「アンカーに workspace ラベルを添える」だが、どちらも 07 が確定したレスポンス行形式に手を入れることになるため、実際に不便が観測されるまで動かさない。
+
+**限界 2 —— `?workspace=work` の接続でも life の数値 id が出る**: `mcp.ts` の `resolveDefaultWorkspace()` の doc コメントは、既定 workspace の意義を「明示し忘れたときに life が会社 PC の画面に出ないための保険」と説明している。全 workspace アンカーはこの保険とわずかに緊張する —— work 接続のエラー文に life の id が混ざるため。**新しい漏れ口ではない**（出るのは数値 id だけで、title も project も出ない。そして id を指定した `get_task` は元々 workspace を問わず引ける）が、「work 接続では life の情報が一切出ない」とまでは言えなくなった、という事実は明記しておく。
+
+**ソース位置**: `todo-format.ts` の `openIdsAnchor()`（CAP）、`todo-tools.ts` の 3 つの not-found 分岐、`mcp.ts` の `resolveDefaultWorkspace()`（「保険」の趣旨）
+
 ### [09/レビュー] search_tasks の 0 件時のスコープ表示を実効検索条件に合わせる
 
 **問題**: `buildSearchResult()` の 0 件メッセージは `include_closed` だけを見て「open のみ」/「closed 含む」を出し分けていた。しかし core 側の `searchTasks()` は `status` 指定があればそれを優先し `includeClosed` を無視する分岐になっている（`if (params.status) {...} else if (!params.includeClosed) {...}`）。この非対称性が formatter に伝わっていなかったため、`status: "done"` を指定して 0 件のときに「open のみ。done / cancelled も探すには include_closed: true」という、実際の検索条件と矛盾する案内を出してしまっていた（status を優先しているのに、まだ include_closed を勧める）。逆に status を open 値に絞りつつ `include_closed: true` のときは、実際より広いスコープを表示していた。
@@ -586,13 +644,77 @@
 
 **ソース位置**: `todo-format.ts` の `buildSearchResult()`（呼び出し元は `todo-tools.ts` の `search_tasks` ハンドラ）
 
-### [09/レビュー] title / project / query の空文字をスキーマ側で弾く
+### [09/レビュー] title / project / query の空文字をスキーマ側で弾く → [09/レビュー2] で撤回
 
-**問題**: `upsertTaskInput` の `title` は更新経路（id あり）では一切検証されていなかった。`upsert_task(id: 12, title: "")` を呼ぶと `updateTask()` の `setIfChanged` が空文字を「現在値と違う」として素直に書き込み、一覧表示が `#12 [todo] ` になって可読性とモデルの参照性を壊す。同様に `searchTasksInput` の `project` / `query` は空文字を許していたため、`if (params.project)` / `if (params.query)`（core 側 `searchTasks()`）が空文字を falsy として無視し、絞ったつもりのフィルタが黙って外れ、全件を返す「絞れていないのに絞れた顔をする」応答になっていた。
+**当初の問題（有効）**: `upsertTaskInput` の `title` は更新経路（id あり）では一切検証されていなかった。`upsert_task(id: 12, title: "")` を呼ぶと `updateTask()` の `setIfChanged` が空文字を「現在値と違う」として素直に書き込み、一覧表示が `#12 [todo] ` になって可読性とモデルの参照性を壊す。同様に `searchTasksInput` の `project` / `query` は空文字を許していたため、`if (params.project)` / `if (params.query)`（core 側 `searchTasks()`）が空文字を falsy として無視し、絞ったつもりのフィルタが黙って外れ、全件を返す「絞れていないのに絞れた顔をする」応答になっていた。
 
-**対応**: `title` を `z.string().min(1).optional()`、`project` / `query` を `z.string().min(1).optional()` に変えた。空文字は SDK のスキーマ検証段階で弾かれ、モデルには自動生成された Input validation error が isError で返る。due と違い、この 3 フィールドのエラー文には「今日」のような呼び出し時にしか分からない値を注入する必要がない（「[09] due だけスキーマ検証にしない理由」参照）ため、素直に Zod 側へ寄せられる。
+**当初の対応（撤回）**: `title` / `project` / `query` を `z.string().min(1).optional()` に変えた。「due と違い、この 3 フィールドには『今日』のような呼び出し時にしか分からない値を注入する必要がないから素直に Zod へ寄せられる」と判断したが、これは 3 部品のうち①②だけを見て③（回復手順）を勘定に入れていなかった。
 
-**ソース位置**: `todo-tools.ts` の `upsertTaskInput` / `searchTasksInput`。`titleRequiredError()` の文言も「title=(未指定)」から「title=(未指定または空)」に更新した（`todo-format.ts`）
+**撤回の理由**: 検証位置がハンドラから Zod スキーマへ移った結果、モデルに届く文言が SDK 自動生成の英語 1 行になった —— `Input validation error: Invalid arguments for tool upsert_task: title: Too small: expected string to have >=1 characters`。3 部品（①不正値のエコー ②期待する形式 ③アンカー・回復手順）のどれも満たしておらず、とくに title の回復手順（「新規作成なら title 必須 / 既存を更新したいなら id を指定」）が丸ごと消えた。「スキーマ検証に落とすと SDK 自動文言になる」ことは due について既に判断済みだった（「[09] due だけスキーマ検証にしない理由」）のに、同じ判断がこの 3 フィールドには適用されなかった。**この退化はサーバー側 87 テストのどれにも捕捉されなかった**（回帰検知が無かったこと自体が別項の「[09/レビュー2] fakeTaskDb を…」の動機）。
+
+あわせて、当時のコミットは `titleRequiredError` の文言を `title=(未指定)` → `title=(未指定または空)` に書き換えたが、`.min(1)` により空文字はその経路に到達しなくなっていた。**到達不能な経路の文言を「その経路も説明します」と書き換えた**状態になっていた。
+
+**現在の対応**: `.min(1)` を外し、検証をハンドラに戻した（due と同じ位置）。エラー文は日本語 3 部品で、それぞれ**実際にその経路へ到達する条件だけ**を説明する:
+
+| 経路 | 到達条件 | 関数 | ③（回復手順） |
+|---|---|---|---|
+| upsert_task 作成 | id 未指定 かつ title が未指定 or `""` | `titleRequiredError(received)` | 既存を更新したいなら id を指定 |
+| upsert_task 更新 | id あり かつ title が `""` | `emptyTitleError()` | 変えないなら title を省略 |
+| search_tasks | query が `""` | `emptyQueryError()` | 絞らないなら query を省略 |
+| search_tasks | project が `""` | `emptyProjectError()` | 絞らないなら project を省略 |
+
+`titleRequiredError` は受け取った値（`undefined` / `""`）をそのままエコーし分けるので、文言と到達条件が一致する。`project` / `memo` の `""` は**拒否ではなく null 正規化**（core 側、前掲の項目）—— 検索の `project` と作成・更新の `project` で扱いが違うのは、前者が「一致させる値」、後者が「保存する値」だから。
+
+**検証**: `packages/server/test/mcp.test.ts` の `[fix-2]`（5 ケース）。3 行であること・`Input validation error` を含まないこと・DB に一切触らずに弾かれることを固定。`.min(1)` を戻す変異で 4 本落ちることを確認した。
+
+**ソース位置**: `todo-tools.ts` の `upsertTaskInput` / `searchTasksInput` と各ハンドラの検証、`todo-format.ts` の `titleRequiredError()` / `emptyTitleError()` / `emptyQueryError()` / `emptyProjectError()`
+
+### [09/レビュー2] エラー文にエコーする外部由来の値を無害化する（規約側で塞ぐ）
+
+**問題**: `?workspace=` の生値をテンプレートリテラルに直挿ししていた（`` `不正な値: workspace="${invalidQueryValue}"` ``）。改行がそのまま通るので、`?workspace=life%22%0A%0A%3CIMPORTANT%3E...` を送ると 3 行のエラー文が 6 行に割れ、注入文が独立した段落として応答本文に入り、閉じ引用符が 3 行下へ流れた（レビューが再現、こちらでも再現済み）。長さ制限も無く、`a`×5000 の値が 5123 文字の応答になった。同じ穴が `invalidDueError`（due の生エコー）にもあった。
+
+読み手はモデルなので、応答本文の行構造は「どこまでがサーバーの言葉か」の唯一の手掛かりになる。値がそれを割れる状態は、エラー文フォーマット規約側の穴。
+
+**対応**: エコーをやめるのではなく（①は 3 部品の一部で、原因特定に要る）、`echoValue()` を 1 つ作って**エコーする値は全部そこを通す**形にした。個々のエラー関数側で生値を埋め込む限り、次に足すエラーで同じ穴が開く。
+
+- 制御文字（C0 / DEL）・改行・タブ・Unicode 行区切り（U+2028 / U+2029）をエスケープ表記に落とす → 値が 1 行を超えられない
+- `"` と `\` もエスケープ → 閉じ引用符の位置を値の中身から動かせない
+- エスケープ後 80 文字で切り、元の文字数を添える（何が来たかは分かり、長さは有界）。切るのはエスケープ単位・code point 単位なので、表記もサロゲートペアも割れない
+
+**実測（対応後）**: 注入値 → 3 行・212 文字（改行は `\n` として 1 行目の中に見える）。`a`×5000 → 3 行・215 文字・`（全 5000 文字）` 付き。due に改行を含む値 → 3 行。
+
+**検証**: `packages/server/test/todo-format.test.ts` の `[fix-4]`（echoValue 単体 + 「どんな入力値でも 3 行」）と `packages/server/test/mcp.test.ts` の `[fix-4]`（実際のツール経路）。生挿入に戻す変異で両方落ちることを確認した。
+
+**副次的な発見**: 最初この変異検知を `vitest -t fix-4` で走らせたとき、`todo-format.test.ts` 側が「落ちない」と出た。原因は仕様ではなくテスト名 —— `[fix-4]` マーカーが describe の**コメント**にしか無く、フィルタが 22 件全部を skip していた（0 件実行の成功）。マーカーを describe のタイトルに入れて再実行し、落ちることを確認した。**マーカーは名前に入れる**（コメントに書くと、選択にも grep にも効かない）。
+
+**ソース位置**: `todo-format.ts` の `echoValue()`。呼び出し元は `workspaceProblemLines()` / `invalidDueError()` / `completeReopenedError()`
+
+### [09/レビュー2] workspace エラーの③（回復手順）はツールとリソースで共有しない
+
+**問題**: 前回「リソース経路もツールと揃える」と決めた結果、`today-agenda` リソースがツール用の文言をそのまま返し、「ツール引数 `workspace` を明示して呼び直してください」と案内していた。しかし `resources/read` のこの Resource には **workspace 引数が存在しない**ので、その手順ではどうやっても再読できない。揃えるべきだったのは**不正値のエコー**であって**回復手順**ではなかった。
+
+**対応**: 共有するのは①②（`workspaceProblemLines()`）だけにし、③は経路ごとに持つ。
+
+| 経路 | ③に書く回復手順 | 実行できるか |
+|---|---|---|
+| ツール（get_agenda / upsert_task / search_tasks） | ツール引数 `workspace` を明示して呼び直す | ○（3 ツールとも引数を持つ） |
+| リソース（todo://today） | 接続 URL の `?workspace=` を直して繋ぎ直す / `get_agenda` ツールを使う | ○（このリソースに引数が無いことも明記） |
+
+**判断の一般形**: 「経路をまたいで揃えるもの」は事実（何が来たか・何を期待するか）であり、「揃えないもの」は呼び出し側の能力に依存する手順。前回は前者と後者を区別せずに揃えた。
+
+**検証**: `packages/server/test/mcp.test.ts` の `[fix-9]` 2 本（リソースが実行不能な手順を含まないこと／ツール側は従来の手順を保つこと）。リソースをツール文言に戻す変異で落ちることを確認した。
+
+**ソース位置**: `todo-format.ts` の `workspaceProblemLines()` / `workspaceMissingError()` / `workspaceMissingText()`
+
+### [09/レビュー2] workspaceMissingError の引数を必須にする
+
+**問題**: `workspaceMissingError` / `workspaceMissingText` の `invalidQueryValue` が optional だったため、5 つ目の呼び出しを足すときに渡し忘れてもコンパイルが通り、「不正値を受け取ったのに『未指定』と答える」修正前の挙動へ静かに戻る。直前のコミット（`fdcccc7`）が直したのがまさにその形の非対称（リソース経路だけ値を受け取っていなかった）であり、**同じ罠が型レベルで残っていた**。
+
+**対応**: `invalidQueryValue: string | undefined` にした。呼び出し側は「クエリが無い」ことを `undefined` として**明示的に**渡す。`SearchScope.status` を optional にせず `Status | undefined` にしたのと同じ判断（「値が無い」を型の上で省略可能にしない）。
+
+**検証**: `packages/server/test/todo-format.test.ts` の `[fix-6]` に `@ts-expect-error` 付きの省略呼び出しを置いた。optional に戻すとディレクティブが未使用になり `tsc --noEmit` が落ちる（実際に optional へ戻す変異で `error TS2578` が出ることを確認）。回帰検知が実行時ではなく型検査にあるケース。
+
+**ソース位置**: `todo-format.ts` の `workspaceMissingError()` / `workspaceMissingText()`
 
 ### [09/レビュー] 表示層・ツール層に DB 不要の単体テストを追加した
 
@@ -601,6 +723,26 @@
 **対応**: `packages/server/test/todo-format.test.ts` を新設し、buildAgenda のセクション境界（期限切れ / 今日が期限 / horizon ちょうど / horizon+1 の除外 / someday に due がある行の除外 / 進行中・待ちの期限なし判定）とフッター件数の内訳、buildSearchResult の 0 件時スコープ表示と絞り込み誘導行、openIdsAnchor の 20 件超過時の挙動を直接テストした。あわせて `packages/server/test/mcp.test.ts` に、素の `all`/`get` だけを持つ fake TaskDb（node:sqlite ではない）を注入した get_agenda 呼び出しを追加し、`?workspace=` の URL 既定値とツール引数 workspace の優先順位（引数が常に勝つ）を実際のツール呼び出し経由で検証した。
 
 **ソース位置**: `packages/server/test/todo-format.test.ts`（新設）、`packages/server/test/mcp.test.ts` の `get_agenda workspace resolution ([09])`
+
+### [09/レビュー2] fakeTaskDb を SQL 分岐型に一般化し、直した振る舞いに回帰検知を付けた
+
+**問題**: 前回追加したテストは副次経路（リソース経路の workspace 解決、URL 既定 vs 引数の優先順位）を固定していたが、**修正の主目標 3 つにテストが無かった**——①ツール 3 経路での不正な `?workspace=` 値のエコー ②`upsert_task` の not-found アンカーに別 workspace の id が載ること ③空文字の拒否。その結果、空文字の応答が日本語 3 部品から SDK の英語 1 行に退化しても、サーバー側 87 テストのどれも落ちなかった。
+
+原因は `mcp.test.ts` の `fakeTaskDb` の形にもあった。`get_agenda` 専用（`all()` は必ず `[]`、引数は無条件に `args[1]` を記録）で、**複数のクエリを区別する必要がある経路には使い回せない**——not-found 経路は `getTask()` の後に `listOpenTaskIds()` を撃つので、固定行を返し分けられないと検証できない。
+
+**対応**: `fakeTaskDb` を SQL 文字列で分岐する形に一般化した。SQL を正規化して 6 種（insert / update / search / openIds / getTask / openTasks）に分類し、種別ごとに固定行を返す。分類できない SQL は `[]` を返さず**投げる**——クエリの形が変わったとき、空の結果に化けるのではなくその場で表面化する。あわせて `workspacesQueried` の記録を `openTasks` 種別だけに限定した（次項）。
+
+これを土台に、今回と前回で直した振る舞いに回帰検知を付けた: `[fix-1]`（complete の結末）/ `[fix-2]`（空文字 5 ケース）/ `[fix-3]`（空文字の null 正規化がバインド値に出ること）/ `[fix-4]`（エコーの無害化）/ `[fix-5]`（3 経路のエコー・両 workspace アンカー）/ `[fix-8]`（下記）/ `[fix-9]`（リソースの回復手順）。**すべて、修正を剥がす変異を実際に当てて落ちることを確認済み**（13 変異／全検知）。
+
+**ソース位置**: `packages/server/test/mcp.test.ts` の `fakeTaskDb()` / `classifyQuery()` / `taskRow()`
+
+### [09/レビュー2] fakeTaskDb は引数の位置に暗黙依存しない
+
+**問題**: 旧 `fakeTaskDb` は全ての `all()` 呼び出しについて `args[1]` を記録していた。`args[1]` が workspace なのは `listOpenTasks()` のバインド順（`[userId, workspace, ...OPEN_STATUSES]`）に限った話なので、`get_agenda` が将来 2 本目のクエリを発行すると、優先順位テストの `toEqual(["work","life"])` が「優先順位が壊れたから」ではなく「クエリ本数が増えたから」落ちる。テストが指す原因と実際の原因がずれる。
+
+**対応**: 記録を `openTasks` 種別のクエリだけに限定した（SQL 分類の副産物）。`[fix-8]` として、2 本のクエリを撃つツール（not-found の `get_task`）を呼んでも `workspacesQueried` が空のままであることを固定してある。
+
+**ソース位置**: `packages/server/test/mcp.test.ts` の `fakeTaskDb()` の `openTasks` 分岐、`[fix-8]`
 
 ---
 

@@ -22,6 +22,22 @@ import { nowIso } from "./time";
 const TASK_COLUMNS =
   "id, workspace, project, title, status, due, memo, created_at, updated_at, closed_at";
 
+/**
+ * null 可の自由テキスト列（project / memo）について、「値なし」の正準表現を null に寄せる。
+ *
+ * `""` を保存すると、書けるのに読めない行ができる。表示側は `if (task.project)` /
+ * `if (task.memo)` で空文字を落とすので一覧にも詳細にも出ず、`searchTasks` の
+ * `if (params.project)` も空文字を無視するので project 絞り込みで永久にヒットしない。
+ * つまり呼び出し側（MCP なら AI）が自力で気付けず復旧もできない不可視の値になる。
+ * 書き込みの入口で潰しておけば、DB に入った値は必ずどこかの読み取り経路から見える。
+ *
+ * 拒否ではなく正規化にしているのは、`""` を送る意図が実質「消す」だから（[09/レビュー2] 参照）。
+ * title には使わない —— 消す意図を表現できる列ではないので、空なら拒否が正しい（入口側の責務）。
+ */
+function nullIfEmpty(value: string | null | undefined): string | null | undefined {
+  return value === "" ? null : value;
+}
+
 /** 期限が近い順 → 期限なしは最後 → 同着は id 順。一覧系は全部この並びで揃える。 */
 const ORDER_BY = "ORDER BY CASE WHEN due IS NULL THEN 1 ELSE 0 END, due, id";
 
@@ -91,8 +107,10 @@ export interface CreateTaskInput extends UserScope {
   workspace: Workspace;
   title: string;
   status?: Status;
+  /** `""` は null（値なし）として保存される。理由は nullIfEmpty を参照。 */
   project?: string | null;
   due?: string | null;
+  /** `""` は null（値なし）として保存される。理由は nullIfEmpty を参照。 */
   memo?: string | null;
   /** テストが時刻を固定するための注入点。通常は省略する。 */
   now?: string;
@@ -110,11 +128,11 @@ export async function createTask(db: TaskDb, input: CreateTaskInput): Promise<Ta
     [
       input.userId,
       input.workspace,
-      input.project ?? null,
+      nullIfEmpty(input.project) ?? null,
       input.title,
       status,
       input.due ?? null,
-      input.memo ?? null,
+      nullIfEmpty(input.memo) ?? null,
       timestamp,
       timestamp,
       isClosedStatus(status) ? timestamp : null,
@@ -130,9 +148,11 @@ export interface UpdateTaskInput extends UserScope {
   /** undefined = 触らない。null 可の列では null = 消す。 */
   title?: string;
   workspace?: Workspace;
+  /** `""` は null（＝消す）として扱われる。理由は nullIfEmpty を参照。 */
   project?: string | null;
   status?: Status;
   due?: string | null;
+  /** `""` は null（＝消す）として扱われる。理由は nullIfEmpty を参照。 */
   memo?: string | null;
   now?: string;
 }
@@ -171,9 +191,11 @@ export async function updateTask(
 
   setIfChanged("title", input.title);
   setIfChanged("workspace", input.workspace);
-  setIfChanged("project", input.project);
+  // project / memo は `""` を null に寄せてから比較する。現在値が null の行に `""` を
+  // 渡しても「変更なし」になり、無意味な UPDATE と嘘の changed が出ない。
+  setIfChanged("project", nullIfEmpty(input.project));
   setIfChanged("due", input.due);
-  setIfChanged("memo", input.memo);
+  setIfChanged("memo", nullIfEmpty(input.memo));
 
   // status だけは closed_at と連動する。open に戻したら closed_at を消すのは、
   // 「終わった時刻」が残ったままだと done/cancelled の再判定材料として嘘になるため。
@@ -198,10 +220,22 @@ export async function updateTask(
   return row ? { task: taskFromRow(row), changed } : null;
 }
 
+/**
+ * complete_task の結末。返す `task` の実際の status と必ず一致する。
+ *
+ * - `completed`: この呼び出しの UPDATE が行を done にした（`task.status === "done"`）
+ * - `already_done`: 既に done だったので何も書いていない（`task.status === "done"`、closed_at は最初の完了時刻）
+ * - `reopened`: UPDATE が 0 行で、読み直したら done ではなかった（`task.status !== "done"`）
+ *
+ * `reopened` は「UPDATE と読み直しの間（本番では Turso 1 往復）に、別マシンが
+ * done → open に戻した」ときにだけ起きる。boolean 1 個（旧 `alreadyDone`）では
+ * この結末を表現できず、status が todo の行に「既に done です」という応答が付いていた。
+ */
+export type CompleteTaskOutcome = "completed" | "already_done" | "reopened";
+
 export interface CompleteTaskResult {
   task: Task;
-  /** 既に done だった場合 true。この場合 UPDATE は走らない（closed_at を上書きしない）。 */
-  alreadyDone: boolean;
+  outcome: CompleteTaskOutcome;
 }
 
 /**
@@ -215,9 +249,19 @@ export interface CompleteTaskResult {
  * `AND status != 'done'` により、2 本目の UPDATE は対象行 0 件で終わる
  * （1 本目が先にコミットして status を 'done' に変えているため）。
  *
- * `alreadyDone` は SELECT の結果ではなく「UPDATE が行を返したかどうか」で決める。
+ * 「今回 done にしたのか」は SELECT の結果ではなく「UPDATE が行を返したかどうか」で決める。
  * UPDATE が 0 行だった場合だけ、「そもそも存在しない（他人の行を含む）」のか
  * 「既に done だった」のかを区別するために getTask で読み直す。
+ *
+ * その読み直しの status を必ず見ること。UPDATE と読み直しの間（本番では Turso 1 往復）
+ * に別マシンが done → open に戻すと、0 行だった理由が「既に done」ではなくなる。
+ * ここで status を確認せず `already_done` を返すと、status が todo・closed_at が null の
+ * 行に「既に done です」という応答が付き、応答本文と返す行の中身が食い違う。
+ * 戻り値の outcome は読み直した行の status からその場で導出しており、両者は乖離できない。
+ *
+ * `reopened` のとき UPDATE をやり直さないのは意図的。open に戻した更新のほうが
+ * 新しい意思表示なので、自動で done に上書きすると、後から来た変更を古い呼び出しが
+ * 静かに巻き戻すことになる。事実（done にならなかった）を返し、判断は呼び出し側に渡す。
  */
 export async function completeTask(
   db: TaskDb,
@@ -231,13 +275,11 @@ export async function completeTask(
     [timestamp, timestamp, params.userId, params.id],
   );
   const row = rows[0];
-  if (row) return { task: taskFromRow(row), alreadyDone: false };
+  if (row) return { task: taskFromRow(row), outcome: "completed" };
 
   const current = await getTask(db, { userId: params.userId, id: params.id });
   if (!current) return null;
-  // ここに来た時点で status は既に 'done'（他人の行なら getTask 自体が null
-  // を返している）。closed_at は最初に完了した時刻のまま。
-  return { task: current, alreadyDone: true };
+  return { task: current, outcome: current.status === "done" ? "already_done" : "reopened" };
 }
 
 export interface SearchTasksParams extends UserScope {

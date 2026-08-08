@@ -33,6 +33,10 @@ import {
   AGENDA_HORIZON_DAYS,
   buildAgenda,
   buildSearchResult,
+  completeReopenedError,
+  emptyProjectError,
+  emptyQueryError,
+  emptyTitleError,
   errText,
   fmtDetail,
   fmtLine,
@@ -90,21 +94,29 @@ const getTaskInput = z.object({
   id: z.number().int().describe("タスク番号（例: 12）"),
 });
 
+// 空文字（`""`）の検証は Zod ではなくハンドラ側で行う（title / query / project の
+// 3 フィールド）。`.min(1)` をスキーマに置くと、モデルに届くのが SDK 自動生成の
+// 英語 1 行になり、06 で確定した日本語 3 部品（とくに回復手順）が失われるため。
+// 理由の全文は todo-format.ts の titleRequiredError 周辺の doc コメント。
 const upsertTaskInput = z.object({
   id: z.number().int().optional().describe("更新対象のタスク番号（例: 12）。省略で新規作成"),
-  // .min(1): 更新経路（id あり）は元々ここ以外で title を検証していなかった。
-  // 空文字を通すと `upsert_task(id, title: "")` が空タイトル行を作れてしまい、
-  // 一覧表示が `#12 [todo] ` になって可読性とモデルの参照性を壊す（[09] 参照）。
-  title: z.string().min(1).optional().describe("タスクの内容（新規作成時は必須）"),
+  title: z.string().optional().describe("タスクの内容（新規作成時は必須）"),
   workspace: workspaceSchema.optional().describe(WS_DESC),
+  // project / memo は `""` を拒否せず null（値なし）に正規化して保存する
+  // （core の nullIfEmpty）。`""` のまま保存すると表示にも project 絞り込みにも
+  // 出てこない不可視の値ができるため。null と同じ意味になることを説明に書く。
   project: z
     .string()
     .nullable()
     .optional()
-    .describe("プロジェクトラベル（自由テキスト。例: 'エンジニア学習'）。null で外す"),
+    .describe("プロジェクトラベル（自由テキスト。例: 'エンジニア学習'）。null または空文字で外す"),
   status: statusSchema.optional().describe(STATUS_DESC),
   due: z.string().nullable().optional().describe(`${DUE_DESC} null で期限を外す`),
-  memo: z.string().nullable().optional().describe("補足メモ・背景・リンクなど。null で消す"),
+  memo: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("補足メモ・背景・リンクなど。null または空文字で消す"),
 });
 
 const completeTaskInput = z.object({
@@ -112,12 +124,13 @@ const completeTaskInput = z.object({
 });
 
 const searchTasksInput = z.object({
-  // .min(1): 空文字は `if (params.project)` / `if (params.query)`（core 側）で
-  // 黙ってフィルタが外れ、絞ったつもりの全件が返ってしまう（[09] 参照）。
-  query: z.string().min(1).optional().describe("title / memo の部分一致キーワード"),
+  // query / project の空文字はハンドラ側で弾く（上の upsertTaskInput のコメント参照）。
+  // 素通しすると core の `if (params.query)` / `if (params.project)` が空文字を
+  // 無視し、絞ったつもりのフィルタが黙って外れて全件が返る。
+  query: z.string().optional().describe("title / memo の部分一致キーワード"),
   workspace: workspaceSchema.optional().describe(WS_DESC),
   status: statusSchema.optional().describe(STATUS_DESC),
-  project: z.string().min(1).optional().describe("プロジェクトラベルの完全一致"),
+  project: z.string().optional().describe("プロジェクトラベルの完全一致"),
   include_closed: z
     .boolean()
     .optional()
@@ -230,6 +243,12 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
       }
 
       if (args.id !== undefined) {
+        // 更新経路の title 検証。ここに来る条件は「id あり かつ title が空文字」だけ
+        // （未指定なら title は触らない）なので、専用の文言を返す。
+        if (args.title === "") {
+          log({ tool: "upsert_task", mode: "update", id: args.id, error: "title_empty" });
+          return emptyTitleError();
+        }
         const result = await updateTask(db, {
           userId,
           id: args.id,
@@ -252,9 +271,15 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
         return ok(`更新 #${result.task.id}（変更: ${changed}）\n${fmtResultTail(result.task)}`);
       }
 
+      // 新規作成経路。ここに来る条件は「id 未指定 かつ title が未指定または空文字」。
+      // 実際に来た値をそのままエコーする（未指定と空文字を区別する）。
       if (!args.title) {
-        log({ tool: "upsert_task", mode: "create", error: "title_missing" });
-        return titleRequiredError();
+        log({
+          tool: "upsert_task",
+          mode: "create",
+          error: args.title === undefined ? "title_missing" : "title_empty",
+        });
+        return titleRequiredError(args.title);
       }
       const workspace = resolveWorkspace(args.workspace);
       if (!workspace) {
@@ -287,16 +312,18 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
     withUser(async (userId, args: CompleteTaskArgs) => {
       const db = deps.openDb();
       const result = await completeTask(db, { userId, id: args.id });
-      log({
-        tool: "complete_task",
-        id: args.id,
-        outcome: result ? (result.alreadyDone ? "already_done" : "done") : "not_found",
-      });
+      log({ tool: "complete_task", id: args.id, outcome: result?.outcome ?? "not_found" });
       if (!result) return taskNotFoundError(args.id, await listOpenTaskIds(db, { userId }), false);
-      if (result.alreadyDone) {
-        return ok(
-          `#${result.task.id} は既に done です（closed_at: ${result.task.closed_at}）。変更なし。`,
-        );
+      // 3 分岐とも core が返した outcome だけを見る。outcome は読み直した行の
+      // status から導出されているので、本文と `result.task` の中身は食い違わない。
+      if (result.outcome === "reopened") {
+        return completeReopenedError(result.task.id, result.task.status);
+      }
+      if (result.outcome === "already_done") {
+        // closed_at は本来 done と同時に入るが、手で書き換えた行では欠けうる。
+        // 無い時に「closed_at: null」と書くくらいなら括弧ごと出さない。
+        const closedAt = result.task.closed_at ? `（closed_at: ${result.task.closed_at}）` : "";
+        return ok(`#${result.task.id} は既に done です${closedAt}。変更なし。`);
       }
       return ok(`完了 ✔\n${fmtLine(result.task)} — workspace: ${result.task.workspace}`);
     }),
@@ -314,6 +341,9 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
     withUser(async (userId, args: SearchTasksArgs) => {
       const workspace = resolveWorkspace(args.workspace);
       log({ tool: "search_tasks", ws: workspace ?? null, closed: args.include_closed ?? false });
+      // 引数の形の検証が先、workspace の解決はその後（upsert_task の due と同じ順序）。
+      if (args.query === "") return emptyQueryError();
+      if (args.project === "") return emptyProjectError();
       if (!workspace) return workspaceMissingError(deps.invalidWorkspaceQuery);
 
       const { total, tasks } = await searchTasks(deps.openDb(), {
@@ -353,9 +383,10 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
       if (!userId) {
         text = "この接続に認証済みアイデンティティがありません。";
       } else if (!deps.defaultWorkspace) {
-        // ツール 3 経路（get_agenda / upsert_task / search_tasks）と同じ
-        // workspaceMissingError の文言を使う。経路によって文言が違う理由が
-        // ないので、未指定・不正値の出し分けもツール側と揃える（[09/レビュー]）。
+        // ツール 3 経路（get_agenda / upsert_task / search_tasks）と揃えるのは
+        // 不正値のエコー（3 部品の①②）まで。回復手順（③）は揃えない ——
+        // この Resource には workspace 引数が無く、「ツール引数 workspace を明示して
+        // 呼び直す」はここでは実行できない手順だから（[09/レビュー2]）。
         text = workspaceMissingText(deps.invalidWorkspaceQuery);
       } else {
         const tasks = await listOpenTasks(deps.openDb(), {

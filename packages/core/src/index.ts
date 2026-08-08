@@ -29,6 +29,7 @@ export {
   listOpenTasks,
   searchTasks,
   updateTask,
+  type CompleteTaskOutcome,
   type CompleteTaskResult,
   type CreateTaskInput,
   type SearchTasksParams,

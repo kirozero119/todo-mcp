@@ -40,6 +40,65 @@ export function errText(lines: string[]): ToolText {
   return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
 }
 
+/** エコーする値の上限（エスケープ後の文字数）。超えた分は切って全長を添える。 */
+const ECHO_MAX_CHARS = 80;
+
+/** 1 文字を「行を壊さない・引用符を閉じ損なわない」表現に置き換える。 */
+function escapeEchoChar(char: string): string {
+  switch (char) {
+    case "\\":
+      return "\\\\";
+    case '"':
+      return '\\"';
+    case "\n":
+      return "\\n";
+    case "\r":
+      return "\\r";
+    case "\t":
+      return "\\t";
+    default:
+      break;
+  }
+  const code = char.codePointAt(0) ?? 0;
+  // C0 制御文字 / DEL / Unicode の行区切り（U+2028, U+2029）。生のまま通すと
+  // 表示側で改行になりうるので、見える形に落とす。
+  if (code < 0x20 || code === 0x7f || code === 0x2028 || code === 0x2029) {
+    return `\\u${code.toString(16).padStart(4, "0")}`;
+  }
+  return char;
+}
+
+/**
+ * エラー文に載せる外部由来の値（接続 URL のクエリ値・ツール引数）を無害化して引用符で包む。
+ *
+ * 3 部品の①「受け取った不正値のエコー」はモデルが原因を特定するための情報なので消さない。
+ * ただし生値をそのままテンプレートリテラルへ差し込むと、値の中の改行が応答本文の行構造を
+ * 割ってしまう。実測では `?workspace=life"%0A%0A<IMPORTANT>...` が 3 行のエラー文を 6 行に
+ * 割り、注入文が独立した段落として応答に入り、閉じ引用符が 3 行下に流れた。長さも無制限で、
+ * 5000 文字の値がそのまま 5123 文字の応答になった。
+ *
+ * そこで①のエコーは必ずこの関数を通す:
+ * - 制御文字・改行・行区切りをエスケープ表記にして、値が 1 行を超えられないようにする
+ * - `"` と `\` もエスケープして、引用符の閉じ位置を値の中身から動かせないようにする
+ * - エスケープ後 80 文字で切り、元の文字数を添える（何が来たかは分かり、長さは有界）
+ *
+ * これは「エラー文フォーマット規約」側の対策なので、値をエコーするエラーは全部ここを通す。
+ * 個々のエラー関数側で生値を埋め込むと、次に足すエラーで同じ穴が開く。
+ */
+export function echoValue(value: string): string {
+  const chars = Array.from(value);
+  let escaped = "";
+  for (const char of chars) {
+    const token = escapeEchoChar(char);
+    // 切るのはエスケープ単位。1 文字分の表記の途中では切らない。
+    if (escaped.length + token.length > ECHO_MAX_CHARS) {
+      return `"${escaped}…"（全 ${chars.length} 文字）`;
+    }
+    escaped += token;
+  }
+  return `"${escaped}"`;
+}
+
 /** `2026-08-08 (土)`。日付だけだと曜日の相対表現（「金曜まで」）を解けない。 */
 export function dateLabel(date: string): string {
   return `${date} (${WEEKDAYS_JA[weekdayIndex(date)]})`;
@@ -138,46 +197,61 @@ export function openIdsAnchor(ids: readonly number[]): string {
 }
 
 /**
- * workspace が未解決（ツール引数省略 かつ 接続既定も未設定）のときの本文。
+ * workspace が未解決のときの 3 部品のうち、①（不正値のエコー）と②（期待する形式）。
  *
  * `invalidQueryValue` は接続 URL に `?workspace=` は付いていたが不正だった
  * 場合の生値。指定があれば「未指定」ではなく実際に来た不正値をエコーする
  * （3 部品の①）。マシン設定のタイプミス（例: `?workspace=lif`）を、
  * 「そもそも指定していない」場合と区別して特定できるようにするため。
+ * 生値は必ず `echoValue()` を通す（理由はその doc コメント）。
  *
- * ツール（ToolText を返す `workspaceMissingError`）とリソース（プレーン
- * テキストを返す `workspaceMissingText`）の両方がこの行配列を共有する。
- * どちらの経路で workspace が未解決になっても同じ文言を返す —— 経路ごとに
- * 別の文言を持つと、片方だけ直して片方を直し忘れる非対称が起きるため。
+ * ツール（`workspaceMissingError`）とリソース（`workspaceMissingText`）で共有するのは
+ * ここまで。③（回復手順）は経路ごとに実行できる操作が違うので共有しない。
  */
-function workspaceMissingLines(invalidQueryValue?: string): string[] {
-  if (invalidQueryValue !== undefined) {
-    return [
-      `不正な値: workspace="${invalidQueryValue}"`,
-      '期待する値: "work" または "life"',
-      "接続 URL の ?workspace= の値が不正です。work または life に直すか、ツール引数 workspace を明示して呼び直してください。",
-    ];
-  }
+function workspaceProblemLines(invalidQueryValue: string | undefined): string[] {
   return [
-    "不正な値: workspace=(未指定)",
+    invalidQueryValue === undefined
+      ? "不正な値: workspace=(未指定)"
+      : `不正な値: workspace=${echoValue(invalidQueryValue)}`,
     '期待する値: "work" または "life"',
-    "この接続には既定 workspace が設定されていません（接続 URL に ?workspace=work|life を付けると設定されます）。ツール引数 workspace を明示して呼び直してください。",
   ];
 }
 
-export function workspaceMissingError(invalidQueryValue?: string): ToolText {
-  return errText(workspaceMissingLines(invalidQueryValue));
+/**
+ * ツール経路（get_agenda / upsert_task / search_tasks）で workspace が未解決のときの本文。
+ *
+ * ③はツール引数 `workspace` を明示して呼び直す手順。この 3 ツールはどれも
+ * `workspace` 引数を持つので、モデルはこの手順をその場で実行できる。
+ *
+ * 引数は optional にしない。省略できると、4 つ目の呼び出しを足すときに
+ * `deps.invalidWorkspaceQuery` を渡し忘れてもコンパイルが通り、「不正値を
+ * 受け取ったのに『未指定』と答える」という直前まであった挙動へ静かに戻る。
+ */
+export function workspaceMissingError(invalidQueryValue: string | undefined): ToolText {
+  return errText([
+    ...workspaceProblemLines(invalidQueryValue),
+    invalidQueryValue === undefined
+      ? "この接続には既定 workspace が設定されていません（接続 URL に ?workspace=work|life を付けると設定されます）。ツール引数 workspace を明示して呼び直してください。"
+      : "接続 URL の ?workspace= の値が不正です。work または life に直すか、ツール引数 workspace を明示して呼び直してください。",
+  ]);
 }
 
 /**
- * `workspaceMissingError` と同じ文言をプレーンテキストで返す。
+ * today-agenda リソース経路で workspace が未解決のときの本文（プレーンテキスト）。
  *
- * today-agenda リソース（`ToolText` ではなく `ReadResourceResult` の
- * `contents[].text` を返す）が、get_agenda / upsert_task / search_tasks の
- * 3 ツールと同じエラー文言をハードコードなしで再利用するために使う。
+ * ①②はツール側と同じ（`workspaceProblemLines`）。③だけが違う ——
+ * `resources/read` のこの Resource には workspace 引数が無いので、「ツール引数
+ * workspace を明示して呼び直す」はこの経路では実行できない手順になる。
+ * 実行できる手順は「接続 URL の `?workspace=` を直して繋ぎ直す」か
+ * 「workspace を引数で渡せる get_agenda ツールを使う」の 2 つ。
  */
-export function workspaceMissingText(invalidQueryValue?: string): string {
-  return workspaceMissingLines(invalidQueryValue).join("\n");
+export function workspaceMissingText(invalidQueryValue: string | undefined): string {
+  return [
+    ...workspaceProblemLines(invalidQueryValue),
+    invalidQueryValue === undefined
+      ? "この接続には既定 workspace が設定されていません。接続 URL に ?workspace=work|life を付けて接続し直すか、workspace を引数で指定できる get_agenda ツールを使ってください（このリソースには workspace 引数がありません）。"
+      : "接続 URL の ?workspace= の値を work または life に直して接続し直すか、workspace を引数で指定できる get_agenda ツールを使ってください（このリソースには workspace 引数がありません）。",
+  ].join("\n");
 }
 
 /**
@@ -188,7 +262,7 @@ export function workspaceMissingText(invalidQueryValue?: string): string {
  */
 export function invalidDueError(value: string, today: string): ToolText {
   return errText([
-    `不正な値: due="${value}"`,
+    `不正な値: due=${echoValue(value)}`,
     "期待する形式: YYYY-MM-DD（例: 2026-08-09）",
     `今日は ${dateLabel(today)} です。相対表現はこの日付を起点に絶対日付へ計算してから指定し直してください。`,
   ]);
@@ -215,11 +289,79 @@ export function taskNotFoundError(
   ]);
 }
 
-export function titleRequiredError(): ToolText {
+/**
+ * complete_task の UPDATE が 0 行で、読み直したらそのタスクが done ではなかった
+ * （core の `completeTask` が `outcome: "reopened"` を返した）。
+ *
+ * 「既に done です」と答えられないのはもちろん、「完了 ✔」とも答えられない
+ * ——実際にはどちらも起きていない。応答本文と行の中身を一致させるための第 3 の文言。
+ * `isError` で返すのは、この状況で正しい次の一手（呼び直し）をモデルに促すため。
+ */
+export function completeReopenedError(id: number, status: Status): ToolText {
   return errText([
-    "不正な値: title=(未指定または空)",
+    `#${id} は done になりませんでした（現在の status: ${echoValue(status)}）。`,
+    "完了にしようとした直後に別の更新が入り、このタスクは open に戻っています。",
+    "完了させたいなら complete_task を同じ id で呼び直してください（done 以外にしたいなら upsert_task で status を明示してください）。",
+  ]);
+}
+
+/**
+ * 空文字（`""`）を弾く 3 フィールドのエラー文は、なぜスキーマではなくここにあるか。
+ *
+ * `title` / `query` / `project` を `z.string().min(1)` にすると、検証位置がハンドラから
+ * Zod スキーマへ移り、モデルに届く文言が SDK 自動生成の英語 1 行になる:
+ * `Input validation error: Invalid arguments for tool upsert_task: title: Too small:
+ * expected string to have >=1 characters`。これは 06 で確定した 3 部品
+ * （①不正値のエコー ②期待する形式 ③アンカー・回復手順）のどれも満たさず、とくに
+ * 「新規作成なら title 必須 / 既存を更新したいなら id を指定」という回復手順が消える。
+ * due について既に下していた判断（「[09] due だけスキーマ検証にしない理由」）と同じ理由で、
+ * この 3 フィールドもハンドラ側で検証し、ここで日本語 3 部品を組み立てる。
+ *
+ * 各エラーは「実際にその経路へ到達する条件」だけを説明する。到達しない条件を
+ * 書くと、文言と経路が食い違ったまま誰も気付けない。
+ */
+
+/**
+ * 新規作成（id 省略）なのに title が無い。`received` は実際に来た値
+ * （`undefined` = 未指定 / `""` = 空文字）で、そのままエコーする。
+ */
+export function titleRequiredError(received: string | undefined): ToolText {
+  return errText([
+    `不正な値: title=${received === undefined ? "(未指定)" : echoValue(received)}`,
     "新規作成には title が必須です。",
     "既存タスクを更新したい場合は id を指定してください。",
+  ]);
+}
+
+/**
+ * 更新経路（id あり）で title に空文字が来た。
+ *
+ * ここでは id が既に渡っているので、`titleRequiredError` の③（「id を指定してください」）
+ * は回復手順にならない。空にしたいのではなく「触りたくない」はずなので、省略に誘導する。
+ */
+export function emptyTitleError(): ToolText {
+  return errText([
+    '不正な値: title=""',
+    "title は空にできません（一覧行が `#12 [todo] ` になり、タスクを識別できなくなります）。",
+    "タイトルを変えないなら title を省略してください。変えるなら 1 文字以上を指定してください。",
+  ]);
+}
+
+/** search_tasks の query に空文字が来た。空文字は「絞り込まない」の意味にはならない。 */
+export function emptyQueryError(): ToolText {
+  return errText([
+    '不正な値: query=""',
+    "query は 1 文字以上のキーワードで指定してください（title / memo の部分一致）。",
+    "キーワードで絞らないなら query を省略してください（workspace 内の open タスクが返ります）。",
+  ]);
+}
+
+/** search_tasks の project に空文字が来た。ラベル無しのタスクを引く指定にはならない。 */
+export function emptyProjectError(): ToolText {
+  return errText([
+    '不正な値: project=""',
+    "project はラベル名の完全一致で指定してください。",
+    "ラベルで絞らないなら project を省略してください。既存ラベルは検索結果の各行に {ラベル} として出ます。",
   ]);
 }
 

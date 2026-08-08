@@ -10,14 +10,14 @@ import {
   searchTasks,
   updateTask,
 } from "../src/tasks";
-import { createInMemoryTaskDb } from "./support/sqlite-task-db";
+import { createInMemoryTaskDb, type InMemoryTaskDb } from "./support/sqlite-task-db";
 
 const ME = "github:1";
 const SOMEONE_ELSE = "github:2";
 const T0 = "2026-08-01T00:00:00Z";
 const T1 = "2026-08-02T00:00:00Z";
 
-let db: TaskDb;
+let db: InMemoryTaskDb;
 
 beforeEach(() => {
   db = createInMemoryTaskDb();
@@ -135,7 +135,7 @@ describe("status 遷移と closed_at", () => {
     const result = await completeTask(db, { userId: ME, id: task.id, now: T1 });
 
     expect(result).toEqual({
-      alreadyDone: false,
+      outcome: "completed",
       task: expect.objectContaining({ status: "done", closed_at: T1, updated_at: T1 }),
     });
   });
@@ -145,8 +145,73 @@ describe("status 遷移と closed_at", () => {
     await completeTask(db, { userId: ME, id: task.id, now: T0 });
 
     const again = await completeTask(db, { userId: ME, id: task.id, now: T1 });
-    expect(again?.alreadyDone).toBe(true);
+    expect(again?.outcome).toBe("already_done");
+    expect(again?.task.status).toBe("done");
     expect(again?.task.closed_at).toBe(T0);
+  });
+
+  // [fix-1] UPDATE が 0 行だった理由は「既に done」だけとは限らない。UPDATE と
+  // 読み直しの間（本番では Turso 1 往復）に別マシンが done → open に戻すと、
+  // 読み直した行は done ではない。ここで status を見ずに already_done を返すと、
+  // status=todo / closed_at=null の行に「既に done です」という応答が付く。
+  it("[fix-1] UPDATE 0 行の直後に reopen されたら already_done とは答えない（返す行と結末が一致する）", async () => {
+    const task = await seed();
+    await completeTask(db, { userId: ME, id: task.id, now: T0 });
+
+    // UPDATE が 0 行で返った直後、getTask が走る前に別マシンが open へ戻す。
+    let reopenedOnce = false;
+    const racing: TaskDb = {
+      all: async (sql, args) => {
+        const rows = await db.all(sql, args);
+        if (sql.includes("UPDATE") && rows.length === 0 && !reopenedOnce) {
+          reopenedOnce = true;
+          await updateTask(db, { userId: ME, id: task.id, status: "todo", now: T1 });
+        }
+        return rows;
+      },
+      get: (sql, args) => db.get(sql, args),
+    };
+
+    const result = await completeTask(racing, { userId: ME, id: task.id, now: T1 });
+
+    expect(reopenedOnce).toBe(true);
+    expect(result?.outcome).toBe("reopened");
+    // 結末と、同時に返す行の実際の status が食い違わないこと。
+    expect(result?.task.status).toBe("todo");
+    expect(result?.task.closed_at).toBeNull();
+  });
+
+  // [fix-1] 上の裏返し。「返した行が done ではないのに done を名乗る結末」が
+  // どの経路からも出ないことを、3 つの結末すべてについて押さえる。
+  it("[fix-1] done を名乗る結末（completed / already_done）は必ず status=done の行と一緒に返る", async () => {
+    const task = await seed();
+
+    const first = await completeTask(db, { userId: ME, id: task.id, now: T0 });
+    expect(first?.outcome).toBe("completed");
+    expect(first?.task.status).toBe("done");
+
+    const second = await completeTask(db, { userId: ME, id: task.id, now: T1 });
+    expect(second?.outcome).toBe("already_done");
+    expect(second?.task.status).toBe("done");
+  });
+
+  // [fix-7] 下の同時実行テストは、ハーネス（node:sqlite 版 TaskDb）の
+  // 「all() は Promise を返す前に文を実行し終えている」という性質に依存している。
+  // その性質が失われると、同時実行テストは落ちるのではなく**無意味になる**
+  // （インターリーブが変わり、実装が壊れていても winners=1 が偶然成立しうる）。
+  // だから依存している性質そのものをここで固定する。ハーネスを本物の非同期 DB に
+  // 差し替えるとこのテストが落ち、同時実行テストの設計をやり直す必要が分かる。
+  it("[fix-7] ハーネスの all() は await より前に文を実行する（下の同時実行テストが依存する性質）", async () => {
+    const task = await seed();
+
+    // await しない。ここで受け取るのは「もう実行済みの結果」を包んだ Promise のはず。
+    const pending = completeTask(db, { userId: ME, id: task.id, now: T1 });
+
+    const row = db.querySync("SELECT status, closed_at FROM tasks WHERE id = ?", [task.id]);
+    expect(row?.status).toBe("done");
+    expect(row?.closed_at).toBe(T1);
+
+    await pending;
   });
 
   it("同時に complete_task しても両方が『今回完了した』と応答せず、closed_at は最初の完了時刻のまま", async () => {
@@ -158,7 +223,7 @@ describe("status 遷移と closed_at", () => {
     // Promise.all で並べた 2 本の completeTask は「両方の UPDATE 文が、
     // どちらの結果も読まれるより先に評価順で逐次実行される」形になり、
     // 2 台からの同時 complete_task で起きる read-then-write レースを
-    // ここで決定的に再現できる。
+    // ここで決定的に再現できる。この前提自体は直上の [fix-7] で固定している。
     const [a, b] = await Promise.all([
       completeTask(db, { userId: ME, id: task.id, now: T1 }),
       completeTask(db, { userId: ME, id: task.id, now: T2 }),
@@ -167,8 +232,8 @@ describe("status 遷移と closed_at", () => {
     const results = [a, b].filter((r): r is NonNullable<typeof r> => r !== null);
     expect(results).toHaveLength(2);
 
-    const winners = results.filter((r) => !r.alreadyDone);
-    const losers = results.filter((r) => r.alreadyDone);
+    const winners = results.filter((r) => r.outcome === "completed");
+    const losers = results.filter((r) => r.outcome === "already_done");
     // ちょうど 1 本だけが「今回完了した」と応答する（両方が名乗ってはいけない）。
     expect(winners).toHaveLength(1);
     expect(losers).toHaveLength(1);
@@ -224,6 +289,70 @@ describe("updateTask の部分更新", () => {
 
     expect(result?.changed).toEqual([]);
     expect(result?.task.updated_at).toBe(T0);
+  });
+
+  // [fix-3] 「書けるが読めない値」を作れないこと。project / memo に `""` が入ると、
+  // 表示（`if (task.project)` / `if (task.memo)`）からも project 絞り込み
+  // （`if (params.project)`）からも落ちるので、呼び出し側が存在に気付けず
+  // 消すこともできない。値なしの正準表現は null 一つだけにする。
+  it("[fix-3] createTask の project/memo が空文字なら null で保存される（不可視の値を作らない）", async () => {
+    const task = await seed({ project: "", memo: "" });
+
+    expect(task.project).toBeNull();
+    expect(task.memo).toBeNull();
+    // 書き込み経路の戻り値だけでなく、読み直しでも null であること。
+    const readBack = await getTask(db, { userId: ME, id: task.id });
+    expect(readBack?.project).toBeNull();
+    expect(readBack?.memo).toBeNull();
+    // DB の生の値も null（空文字が入っていない）。
+    const row = db.querySync("SELECT project, memo FROM tasks WHERE id = ?", [task.id]);
+    expect(row?.project).toBeNull();
+    expect(row?.memo).toBeNull();
+  });
+
+  it("[fix-3] updateTask の project/memo に空文字を渡すと null になる（null 指定と同じ「消す」）", async () => {
+    const task = await seed({ project: "家計", memo: "元のメモ" });
+
+    const result = await updateTask(db, {
+      userId: ME,
+      id: task.id,
+      project: "",
+      memo: "",
+      now: T1,
+    });
+
+    expect(result?.changed).toEqual(["project", "memo"]);
+    expect(result?.task.project).toBeNull();
+    expect(result?.task.memo).toBeNull();
+    const row = db.querySync("SELECT project, memo FROM tasks WHERE id = ?", [task.id]);
+    expect(row?.project).toBeNull();
+    expect(row?.memo).toBeNull();
+  });
+
+  it("[fix-3] 既に null の project に空文字を渡しても『変更あり』にはならない", async () => {
+    const task = await seed();
+
+    const result = await updateTask(db, { userId: ME, id: task.id, project: "", now: T1 });
+
+    expect(result?.changed).toEqual([]);
+    expect(result?.task.updated_at).toBe(T0);
+  });
+
+  it("[fix-3] 空文字で保存した project は search の project 絞り込みからも取り出せない値にならない", async () => {
+    // `""` が保存できてしまうと、この検索は永久にヒットしない行を残す。
+    const task = await seed({ project: "" });
+
+    const found = await searchTasks(db, { userId: ME, workspace: "life", limit: 20 });
+    expect(found.tasks.map((t) => t.project)).toEqual([null]);
+    // ラベル無しの行が「ラベルあり」として数えられていないこと。
+    const byEmpty = await searchTasks(db, {
+      userId: ME,
+      workspace: "life",
+      project: "家計",
+      limit: 20,
+    });
+    expect(byEmpty.total).toBe(0);
+    expect(task.project).toBeNull();
   });
 
   it("workspace も更新できる（レンズの移動）", async () => {
