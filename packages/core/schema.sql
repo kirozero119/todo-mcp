@@ -4,9 +4,10 @@
 -- 実運用中の本番を汚さないため）。適用は:
 --   turso db shell todo-mcp-dev < packages/core/schema.sql
 --
--- sqlite_sequence を旧 DB の最終 id（149）に合わせる初期化はここには入れない。
+-- sqlite_sequence を旧 DB の最終 id に合わせる初期化はここには入れない。
 -- 旧 todos.db からの移行はチケット 10 の仕事であり、そこで id を保持したまま
--- INSERT する手順とセットで初めて意味を持つため。
+-- INSERT する手順とセットで初めて意味を持つため（packages/migrate が行う。
+-- 実測の最終 id は 153 —— 03 が書いた 149 は着手時点で失効していた）。
 CREATE TABLE tasks (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    TEXT NOT NULL,                -- 'github:<数値id>' 名前空間付き

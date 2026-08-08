@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "lib": ["es2022"],
+    // Workers ではなく手元の Node で走る唯一のパッケージ。node:sqlite で旧 DB を
+    // 読み、process.argv でモードを受け取るので、test だけでなく src にも node 型が要る。
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true
+  },
+  "include": ["src", "test", "vitest.config.ts"]
+}

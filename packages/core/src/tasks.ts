@@ -143,6 +143,64 @@ export async function createTask(db: TaskDb, input: CreateTaskInput): Promise<Ta
   return taskFromRow(row);
 }
 
+export interface ImportTaskInput extends UserScope {
+  /** 旧 DB の id をそのまま持ち込む（発番させない）。 */
+  id: number;
+  workspace: Workspace;
+  /** `""` は null（値なし）として保存される。理由は nullIfEmpty を参照。 */
+  project?: string | null;
+  title: string;
+  status: Status;
+  /** `""` は null。値がある場合は YYYY-MM-DD であること（検証は呼び出し側）。 */
+  due?: string | null;
+  /** `""` は null（値なし）として保存される。理由は nullIfEmpty を参照。 */
+  memo?: string | null;
+  /** ISO 8601 UTC。移行元の値をそのまま持ち込むので「今」を使わない。 */
+  createdAt: string;
+  updatedAt: string;
+  /** `""` は null。status と整合するかの判断は呼び出し側（移行元の値を尊重する）。 */
+  closedAt?: string | null;
+}
+
+/**
+ * 旧 todos.db の 1 行を、id とタイムスタンプを保ったまま INSERT する（チケット 10 の移行専用）。
+ *
+ * createTask と分けているのは、この関数が持つ 3 つの権限——id を指定する /
+ * created_at・updated_at を過去の値にする / closed_at を status から導出せず
+ * そのまま置く——が、日常の書き込み経路にあってはならないものだから。
+ * createTask のオプション引数として足すと、MCP ツールから「作成日時を偽装した
+ * タスク」や「他人の id を狙った INSERT」が書ける形になる。別関数にして
+ * 移行スクリプトからだけ呼べば、その経路は生えない。
+ *
+ * 移行スクリプトがこの関数を呼ぶ（自前で INSERT を書かない）のは、このファイルの
+ * 冒頭に書いた不変条件——tasks への SQL は全部ここにあり、user_id を条件・値に
+ * 持たない文が 1 つも無いことを grep で確認できる——を移行でも壊さないため。
+ */
+export async function importTask(db: TaskDb, input: ImportTaskInput): Promise<Task> {
+  const rows = await db.all(
+    `INSERT INTO tasks
+       (id, user_id, workspace, project, title, status, due, memo, created_at, updated_at, closed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     RETURNING ${TASK_COLUMNS}`,
+    [
+      input.id,
+      input.userId,
+      input.workspace,
+      nullIfEmpty(input.project) ?? null,
+      input.title,
+      input.status,
+      nullIfEmpty(input.due) ?? null,
+      nullIfEmpty(input.memo) ?? null,
+      input.createdAt,
+      input.updatedAt,
+      nullIfEmpty(input.closedAt) ?? null,
+    ],
+  );
+  const row = rows[0];
+  if (!row) throw new Error("INSERT ... RETURNING が行を返さなかった");
+  return taskFromRow(row);
+}
+
 export interface UpdateTaskInput extends UserScope {
   id: number;
   /** undefined = 触らない。null 可の列では null = 消す。 */

@@ -1,0 +1,21 @@
+{
+  "name": "@todo-mcp/migrate",
+  "version": "0.0.0",
+  "private": true,
+  "description": "旧 Python CLI の todos.db から Turso へタスクを移す 1 回きりの移行スクリプト（wayfinder チケット 10）",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "migrate": "vite-node src/main.ts --"
+  },
+  "dependencies": {
+    "@todo-mcp/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vite-node": "^3.2.0",
+    "vitest": "^3.2.0"
+  }
+}

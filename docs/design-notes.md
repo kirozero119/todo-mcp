@@ -64,6 +64,15 @@
   - [09/レビュー2] project / memo の空文字を null に正規化する（書けるが読めない値を作らない）
   - [09/レビュー] updateTask の SELECT→UPDATE は非トランザクション —— 許容している理由
   - [09/レビュー2] 同時実行テストが依存するハーネスの性質を固定する
+- [packages/migrate](#packagesmigrateチケット-10-旧-todosdb-からの移行)
+  - [10] 移行スクリプトを packages/migrate という新しいワークスペースにした
+  - [10] INSERT を core の `importTask()` にして、移行スクリプトに生 SQL を書かなかった
+  - [10] sqlite_sequence だけは移行パッケージ側の生 SQL にした
+  - [10] updated_at に created_at をそのまま入れた
+  - [10] `YYYY-MM-DD HH:MM` の due を日付に丸めた（旧 DB に 2 件実在）
+  - [10] `"" → null` の防御は入れたが、実データでは 1 件も発火しなかった
+  - [10] 2 回実行すると PRIMARY KEY で止まる（事故防止として機能する）
+  - [10] 接続先の取り違えを 2 段で塞ぐ
 - [todo-tools.ts / todo-format.ts](#todo-toolsts--todo-formatts)
   - [09] user_id を引数から受け取らない構造（withUser）
   - [09] due だけスキーマ検証にしない理由
@@ -567,6 +576,86 @@
 **検証**: `all()` を `await new Promise(setTimeout)` 経由の実非同期に差し替える変異で、この性質テストが落ちることを確認した。
 
 **ソース位置**: `packages/core/test/support/sqlite-task-db.ts` の `createInMemoryTaskDb()` / `InMemoryTaskDb`、`packages/core/test/tasks.test.ts` の `[fix-7]`
+
+---
+
+## packages/migrate（チケット 10: 旧 todos.db からの移行）
+
+### [10] 移行スクリプトを packages/migrate という新しいワークスペースにした
+
+**選択肢**: ①`packages/core/scripts/` に置く ②リポジトリ直下に `scripts/` を作る ③`packages/*` の作法どおり新しいワークスペースにする。
+
+**決め手になった軸**: (a) リポジトリ自身の `npm run typecheck` / `npm test` が自動で拾うか (b) core の依存表面を汚さないか (c) 消しやすいか。
+
+**判断**: ③。(a) ルートの `"workspaces": ["packages/*"]` に自動で乗るので、`--workspaces --if-present` の typecheck とテストが最初から効く（②は workspace ではないので、この 2 つの網から外れる）。(b) このスクリプトは Node 専用のもの（`node:sqlite`・`process.argv`・TS ランナーの `vite-node`）を要求する。core は Worker にも CLI（チケット 11）にもバンドルされる唯一の共有層で、「core / server の境界をどこで切ったか」がこの設計の背骨なので、1 回きりのスクリプトのために core の devDependencies と tsconfig の `types` を動かしたくない。①はその境界の記述を弱める。(c) パッケージごと消せば跡形もなく消える。
+
+**波及**: `packages/cli`（チケット 11）が増えても同じ形で並ぶ。`npm test` の内訳は core 39 / migrate 18 / server 121 になった。
+
+**ソース位置**: `packages/migrate/package.json`、`packages/migrate/tsconfig.json`
+
+### [10] INSERT を core の `importTask()` にして、移行スクリプトに生 SQL を書かなかった
+
+**問題**: 移行は「旧 id を保持し、created_at / updated_at / closed_at に過去の値を置く」INSERT を必要とする。`createTask()` はどれもできない（id は DB が発番、タイムスタンプは「今」、closed_at は status から導出）。
+
+**選んだ形**: core に `importTask()` を足し、スクリプトからはそれを呼ぶ。`createTask()` にオプション引数として足す形は採らなかった —— id とタイムスタンプを外から指定できる権限が日常の書き込み経路（MCP ツール）に生えることになり、「作成日時を偽装したタスク」や「他人が使う予定の id を先に埋める INSERT」が書けてしまう。別関数なら、その経路は移行スクリプトからしか届かない。
+
+**core に置いた理由**: `tasks.ts` 冒頭の不変条件 —— tasks への SQL は全部このファイルにあり、user_id を条件または値に持たない文が 1 つも無いことを grep で確認できる —— を移行でも壊さないため。スクリプト側に INSERT を書くと、その日から「grep で確認できる」が嘘になる。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `importTask()` / `ImportTaskInput`
+
+### [10] sqlite_sequence だけは移行パッケージ側の生 SQL にした
+
+**理由**: `sqlite_sequence` は tasks ではなく SQLite 内部の採番状態で、user_id で絞る対象が存在しない。core に置くと「user_id を持たない文」が 1 本混ざり、上の不変条件が grep で確認できなくなる。tasks 以外を触る唯一の操作なので、`packages/migrate/src/sequence.ts` に隔離した。
+
+**何のために要るか**: `--only-open` では移行しない done の id（最大 153）がカウンタに載らない場合があり、新規タスクがアーカイブ済みの番号を再利用しうる。会話 UI で「12 番終わった」と言える設計（03 §5）では、番号の重複が履歴の取り違えに直結する。引き上げのみ（既存値のほうが大きければ何もしない）にしてあるのは、下げると使用済み id を再発番する DB を作ってしまうため。
+
+**実測**: 旧 id を明示した INSERT で SQLite が自動的にカウンタを 153 まで上げるため、実際にはこの UPDATE は「変更なし」で終わった。それでも残すのは、`--only-open` で最大 id の行が open でないケース（今後 done が増えれば起こる）では自動更新が 153 に届かないため。
+
+**ソース位置**: `packages/migrate/src/sequence.ts` の `raiseTaskSequence()`
+
+### [10] updated_at に created_at をそのまま入れた
+
+**問題**: 新スキーマの `updated_at` は NOT NULL だが、旧 todos.db に更新履歴に相当する列が無い。候補は ①`created_at` と同値 ②移行を実行した「今」 ③`closed_at` があればそれ。
+
+**判断**: ①。②は「全 148 行が移行日に更新された」という起きていない出来事を記録することになり、`fmtDetail` が `created: ... / updated: ...` を出す目的（塩漬け判定 —— 最後に触ったのはいつか）を正面から潰す。③は done の行だけ整合するが、open の行には使えないので結局 2 通りの規則が混ざる。①なら「移行後に一度も更新されていない」という事実がそのまま読める。
+
+**既知の歪み**: 全件移行した場合、done の行は `updated_at < closed_at` になる（例: created 2026-03-30 / closed 2026-03-31 / updated 2026-03-30）。「done にした操作」もまた更新なので、厳密には updated_at はそれ以上であるべき。実運用では done 140 件を prod へ移す予定が無い（`--only-open`）ので放置している。全件を prod に入れる判断をするなら、ここは `MAX(created_at, closed_at)` に直すか、歪みを承知で残すかを決め直すこと。
+
+**ソース位置**: `packages/migrate/src/transform.ts` の `transformRow()`
+
+### [10] `YYYY-MM-DD HH:MM` の due を日付に丸めた（旧 DB に 2 件実在）
+
+**問題**: 旧 DB の `due` は 87 件が NULL、59 件が `YYYY-MM-DD`、そして **2 件（#91 / #92）が `YYYY-MM-DD HH:MM`**（`2026-03-30 18:00` / `2026-03-31 18:00`）だった。どちらも done。03 §7 は「`due` のみ日付 `YYYY-MM-DD` のまま —— 締切は瞬間ではなく日」と決めている。
+
+**判断**: 時刻部分を落として日付だけにし、落としたことを実行ログに `due_time_dropped` として出す。verbatim で通すと、`isCalendarDate()` を通らない値が新 DB に残る —— upsert_task はこの形式を受け付けないので**ツール経由では二度と作れず、直すこともできない**値になり、`fmtLine` の表示や `buildAgenda` の日付比較が想定していない領域に出る。失うのは「18:00」という、新スキーマがそもそもモデル化していない情報。
+
+**射程**: 2 件とも done なので `--only-open`（prod へ移す予定の経路）では 1 件も当たらない。全件移行でのみ発火する。
+
+**ソース位置**: `packages/migrate/src/transform.ts` の `normalizeDue()`
+
+### [10] `"" → null` の防御は入れたが、実データでは 1 件も発火しなかった
+
+**背景**: [09/レビュー2]「project / memo の空文字を null に正規化する」と同じ欠陥クラス —— `""` は書けるのに `fmtLine` / `fmtDetail` / `searchTasks` のどの真偽判定にも引っかからず、不可視の値になる。移行は core の書き込み関数を通るので `importTask()` 側の `nullIfEmpty()` でも潰れるが、変換側（`transform.ts`）にも同じ正規化を置き、発火したら `empty_to_null` として実行ログに出すようにした。
+
+**実測**: 旧 DB の `category` / `memo` / `due` / `title` に空文字は 0 件。148 件の全件移行でも `empty_to_null` は 1 度も出ていない。「実データに無いから要らない」ではなく「入ってきたら壊れる」ので入口に置いてある、という位置づけ。防御が生きていることは合成データのテストで固定した（`packages/migrate/test/transform.test.ts`）。
+
+**ソース位置**: `packages/migrate/src/transform.ts` の `textOrNull()`
+
+### [10] 2 回実行すると PRIMARY KEY で止まる（事故防止として機能する）
+
+**実測**: 同じ対象に `--execute` を 2 回かけると、1 行目（id=1）の INSERT が `SQLITE_CONSTRAINT: UNIQUE constraint failed: tasks.id` で失敗し、`0/8 件を投入済み` と表示して終了コード 1 で止まる。行数も sqlite_sequence も変化しない。旧 id を明示保持する設計の副産物として、二重投入は DB 側で構造的に不可能になっている。
+
+**トランザクションを張っていないことの限界**: 途中の行（例: ネットワーク断で 100 件目）で落ちると、そこまでの行は入ったまま残る。復旧は「対象 DB を空にしてやり直す」で、そのために失敗時は必ず投入済み件数を出す。再実行が上記のとおり必ず 1 行目で止まるので、「部分的に入った状態にもう一度重ねる」事故は起きない。
+
+**ソース位置**: `packages/migrate/src/main.ts` の `main()` の INSERT ループ
+
+### [10] 接続先の取り違えを 2 段で塞ぐ
+
+**設計**: ①`--target dev|prod` を必須にし、資格情報も `TURSO_DEV_*` / `TURSO_PROD_*` と target ごとに別の環境変数から読む（共通の `TURSO_DATABASE_URL` は読まない —— シェルに残った値の向き先で書き込み先が決まる形を作らない）。②それでも防げない「環境変数の中身を貼り間違えた」場合のために、URL のホスト名が `todo-mcp-<target>` で始まることを確認し、違えば接続する前に止める。
+
+**モードにも既定値を置かない**: `--dry-run` と `--execute` はどちらか一方が必須で、両方でも片方も無しでもエラー。既定値があると「どちらが既定だったか」を思い出す必要が生まれ、思い出し間違いがそのまま書き込みになる。
+
+**ソース位置**: `packages/migrate/src/main.ts` の `resolveTarget()` / `parseArgs()`
 
 ---
 

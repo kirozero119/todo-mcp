@@ -2,8 +2,9 @@
 
 実用的な Todo MCP サーバー。Turso + GitHub OAuth + ワークスペース切り替え。MCP spec 2026-07-28 / SDK v2 上に構築。
 
-現在の状態: **認証つきサーバー + Todo ツール本実装**。ツールセット v1（5 ツール + Resource /
-Prompt 各 1）が Turso 上で動く。旧 `todos.db` からのデータ移行と `packages/cli` は後続チケット。
+現在の状態: **認証つきサーバー + Todo ツール本実装 + 旧 DB からの移行スクリプト**。ツールセット v1
+（5 ツール + Resource / Prompt 各 1）が Turso 上で動き、旧 `todos.db` の中身を `packages/migrate`
+で移せる。`packages/cli` は後続チケット。
 
 ## 構成
 
@@ -25,6 +26,12 @@ packages/server/     Cloudflare Worker: MCP サーバー（Resource Server）+ O
   src/allowlist.ts   純粋な認可ヘルパー関数（ユニットテスト済み）
   src/approval.ts    同意ダイアログ、CSRF、OAuth state のバインディング
   src/redirect-uri.ts  DCR登録と GET /authorize で共有する redirect_uri ポリシー
+
+packages/migrate/    旧 Python CLI の todos.db → Turso の 1 回きりの移行（Node で走る）
+  src/main.ts        CLI 本体（--target / --dry-run|--execute / --only-open）
+  src/legacy.ts      旧 todos.db の読み出し（readOnly で開く）
+  src/transform.ts   旧 1 行 → 新 1 行の変換規則（純粋関数・テスト対象）
+  src/sequence.ts    sqlite_sequence の引き上げ（tasks 以外を触る唯一の生 SQL）
 ```
 
 npm workspaces のモノレポ構成。`packages/cli` は後日追加予定。
@@ -58,6 +65,29 @@ turso db show todo-mcp-dev --url        # 出力を .dev.vars の TURSO_DATABASE
 
 開発用（`todo-mcp-dev`）と本番用（`todo-mcp-prod`）で DB を分けている。本番 URL は既に複数の
 マシンから実運用されているため、開発中の書き込みで汚さないための分離。
+
+## 旧 todos.db からの移行
+
+旧 Python CLI（`~/life/todos/todos.db`）のタスクを Turso へ移す。1 回きりの作業だが、
+やり直せることが安全性の中心なので、スクリプトとしてリポジトリに残してある。
+
+```bash
+# 接続先は target ごとに別の環境変数から取る（共通の TURSO_DATABASE_URL は読まない）
+export TURSO_DEV_DATABASE_URL=$(turso db show todo-mcp-dev --url)
+export TURSO_DEV_AUTH_TOKEN=$(turso db tokens create todo-mcp-dev)
+
+# 何が入るかを見る（書き込みなし。投入予定の行を全部 JSON で出す）
+npm run migrate --workspace @todo-mcp/migrate -- --target dev --dry-run --only-open
+
+# 実行
+npm run migrate --workspace @todo-mcp/migrate -- --target dev --execute --only-open
+```
+
+- `--dry-run` / `--execute` は**どちらかを必ず書く**（既定値は無い）。
+- `--only-open` で done を除く。付けなければ全件（done も含む）。
+- 旧 id をそのまま持ち込むので、**同じ対象に 2 回実行すると 1 行目で PRIMARY KEY 制約に当たって
+  止まる**（0 件投入で終わる）。やり直すときは対象 DB を空にしてから。
+- 移行元は `readOnly` で開く。旧 `todos.db` はアーカイブとして凍結する方針。
 
 ## 認可の仕組み
 
