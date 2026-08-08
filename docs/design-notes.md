@@ -39,7 +39,7 @@
   - [P1-2/L-7] audience 補完と resourceMatchOriginOnly の対応
   - [scope enforcement] grantedScopes を一度だけ計算し、grant と props の両方に使う
   - [09/複数端末] revokeExistingGrants の無効化は CIMD 経路にだけ掛ける
-  - [09/複数端末] 端末を失くしたときに実際に打てる kill switch は KV の grant 削除
+  - [09/複数端末] 端末を失くしたときに実際に打てる kill switch は KV の token/grant 削除
   - [09/複数端末] grant の30日は認可時点からの絶対値で、refresh では延びない
   - [09/複数端末] purgeExpiredData を cron で回す必要がない理由
 - [index.ts](#indexts)
@@ -367,9 +367,9 @@
 
 **ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ、`completeAuthorization()` 呼び出し直前の `grantRevocationPolicy`
 
-### [09/複数端末] 端末を失くしたときに実際に打てる kill switch は KV の grant 削除
+### [09/複数端末] 端末を失くしたときに実際に打てる kill switch は KV の token/grant 削除
 
-上の緩和で手放したのは「再認可が古い grant を掃除してくれる」性質なので、「じゃあ端末を失くしたら何を打てばいいのか」に答えが要る。**結論から言うと、打てるのは KV の grant キー削除だけ**。以下の2つは代わりにならない。
+上の緩和で手放したのは「再認可が古い grant を掃除してくれる」性質なので、「じゃあ端末を失くしたら何を打てばいいのか」に答えが要る。**結論から言うと、打てるのは KV のキーを直接消すことだけ**（`token:` を先、`grant:` を後。順序の理由は下の手順に書いた）。以下の2つは代わりにならない。
 
 **RFC 7009 の個別 revoke は「失くした端末の refresh token」を要求する**。provider の revocation endpoint は token endpoint と同じ `/token`（`revocation_endpoint: tokenEndpoint`、`!body.grant_type && !!body.token` で分岐）で確かに動くが、`revokeToken()` は `body.token` から `userId:grantId:secret` を取り出し、`revokeRefreshIfOwned()` が `grantData.refreshTokenId === tokenId`（または `previousRefreshTokenId`）で照合する。つまり**対象マシンの refresh token を手元に持っていないと、その grant は revoke できない**。端末を紛失したというまさに revoke が要る場面では、その token は失った端末の中にある。「代わりに RFC 7009 がある」は、失われた当のものを要求している。
 
