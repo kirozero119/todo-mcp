@@ -1,10 +1,35 @@
 /**
- * tasks テーブルに対する SQL は全部ここにある。MCP サーバーにも CLI にも生 SQL は書かない。
+ * **`TaskDb`（新スキーマの tasks）に対する SQL は全部ここにある**。
+ * MCP サーバーにも CLI にも移行スクリプトにも生 SQL は書かない。
  *
  * ここに集めている最大の理由は user_id スコープの強制。この 1 ファイルを grep すれば
  * 「user_id を条件に持たない文が 1 つもない」ことを機械的に確認できる状態を保つ
  * （SELECT / UPDATE は `WHERE user_id = ?`、INSERT は user_id を必ず値として書く）。
  * user_id は必ず引数で受け取り、この層では認証コンテキストを一切見ない。
+ *
+ * **不変条件の確認手順**。テーブル名で grep 1 本では確認できない ——
+ * `packages/migrate/src/legacy.ts` が読む旧 todos.db のテーブル名も `tasks` で衝突するため。
+ * 「`TaskDb` に対する文か」で切ると構造的に区別できるので、2 本に分ける:
+ *
+ *     $ grep -rEln '(FROM|INTO|UPDATE) tasks' packages --include='*.ts' \
+ *         --exclude-dir=test --exclude-dir=node_modules
+ *     packages/core/src/tasks.ts        <- ここ
+ *     packages/migrate/src/legacy.ts    <- 2 本目で対象外と分かる
+ *
+ *     $ grep -n 'import .*TaskDb' packages/migrate/src/legacy.ts
+ *     （出力なし = TaskDb を import していない = 新 DB のハンドルを受け取る手段が無い）
+ *
+ * 2 本目を `grep -l TaskDb <file>` にしないこと —— legacy.ts の doc コメントは
+ * 「TaskDb を受け取らない」と説明するために `TaskDb` という語を含むので、
+ * その形だと自分の説明文に引っかかって常に真になる。
+ *
+ * 新 DB へ文を送れるのは `TaskDb` を受け取るコードだけなので、2 本目が空なら
+ * legacy.ts は構造的にこの不変条件の外。逆に `packages/migrate/src/sequence.ts` は
+ * `TaskDb` を受け取るが `sqlite_sequence` しか触らず、1 本目に出てこないことで確認できる。
+ *
+ * この 2 本は「今どうなっているか」を確認するもので、将来の違反を止めるものではない。
+ * 同じ判定は `packages/core/test/invariants.test.ts` が毎回実行している
+ * （そちらはコメントを落としてから見るので、doc コメント中の `TaskDb` には反応しない）。
  */
 import type { TaskDb } from "./db";
 import {
@@ -173,8 +198,11 @@ export interface ImportTaskInput extends UserScope {
  * 移行スクリプトからだけ呼べば、その経路は生えない。
  *
  * 移行スクリプトがこの関数を呼ぶ（自前で INSERT を書かない）のは、このファイルの
- * 冒頭に書いた不変条件——tasks への SQL は全部ここにあり、user_id を条件・値に
+ * 冒頭に書いた不変条件——`TaskDb` への SQL は全部ここにあり、user_id を条件・値に
  * 持たない文が 1 つも無いことを grep で確認できる——を移行でも壊さないため。
+ *
+ * `due` はここでは検証しない。`isCalendarDate()` を満たす値であることは**呼び出し側の前提**で、
+ * 移行スクリプトは `packages/migrate/src/transform.ts` の `normalizeDue()` でそれを保証している。
  */
 export async function importTask(db: TaskDb, input: ImportTaskInput): Promise<Task> {
   const rows = await db.all(

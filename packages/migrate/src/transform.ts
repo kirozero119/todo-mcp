@@ -51,6 +51,15 @@ const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_SECONDS_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
 /**
+ * 旧 DB に実在した唯一の非 `YYYY-MM-DD` な due 形式（#91 / #92 の `2026-03-30 18:00`）。
+ *
+ * 全体一致で書いてあることが本質。以前は「先頭 10 文字が日付なら採用」だったので、
+ * `2026-03-30oops` のような**有効な日付で始まる不正値**が正常な due として静かに
+ * 通ってしまった。未知の形式は丸めずに止める、が transform.ts 全体の方針。
+ */
+const LEGACY_DUE_WITH_TIME = /^(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}$/;
+
+/**
  * 空文字を null に寄せる（09 の指摘への防御）。
  *
  * `""` のまま入れると、表示（`fmtLine` / `fmtDetail` はどれも真偽判定）にも
@@ -97,22 +106,29 @@ export function toIsoTimestamp(value: string, context: { id: number; column: str
  * 時刻部分を落として日付だけにし、落としたことを note に残す。verbatim で
  * 通すと、ツール経由では二度と作れず編集もできない値が新 DB に残り、
  * `isCalendarDate` を前提にした表示・比較の外側に出てしまう。
+ *
+ * 丸めるのは**旧形式として確認済みのこの 1 つだけ**。それ以外は未知の形式として
+ * 止める —— 先頭 10 文字を切り出す実装だと `2026-03-30oops` のような値が
+ * 「有効な日付」として通り、移行が黙って値を作り変えることになる。
  */
 function normalizeDue(value: string | null, id: number, notes: TransformNote[]): string | null {
   const text = textOrNull(value, { id, column: "due" }, notes);
   if (text === null) return null;
   if (isCalendarDate(text)) return text;
 
-  const head = text.slice(0, 10);
-  if (DATE_ONLY.test(head) && isCalendarDate(head)) {
+  const legacyMatch = LEGACY_DUE_WITH_TIME.exec(text);
+  const date = legacyMatch?.[1];
+  if (date !== undefined && isCalendarDate(date)) {
     notes.push({
       id,
       kind: "due_time_dropped",
-      detail: `due: ${JSON.stringify(text)} → ${JSON.stringify(head)}（時刻部分を落とした）`,
+      detail: `due: ${JSON.stringify(text)} → ${JSON.stringify(date)}（時刻部分を落とした）`,
     });
-    return head;
+    return date;
   }
-  throw new MigrationDataError(`#${id} due: ${JSON.stringify(text)} を YYYY-MM-DD にできない`);
+  throw new MigrationDataError(
+    `#${id} due: ${JSON.stringify(text)} は YYYY-MM-DD でも旧形式 "YYYY-MM-DD HH:MM" でもない（未知の形式は丸めずに止める）`,
+  );
 }
 
 /** 旧 1 行 → `importTask()` に渡す 1 件。 */

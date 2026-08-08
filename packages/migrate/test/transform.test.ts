@@ -113,6 +113,31 @@ describe("防御（発火すると note が残る）", () => {
     ]);
   });
 
+  // 丸めるのは旧形式として確認済みの `YYYY-MM-DD HH:MM` だけ。先頭 10 文字を
+  // 切り出す実装だと、下のような「有効な日付で始まる不正値」が正常な due として通る。
+  it("有効な日付で始まる未知の形式は丸めずに止める", () => {
+    expect(() => transformOne(legacyRow({ due: "2026-03-30oops" }))).toThrow(MigrationDataError);
+    expect(() => transformOne(legacyRow({ due: "2026-03-30T18:00:00Z" }))).toThrow(
+      MigrationDataError,
+    );
+    expect(() => transformOne(legacyRow({ due: "2026-03-30 18:00:00" }))).toThrow(
+      MigrationDataError,
+    );
+    expect(() => transformOne(legacyRow({ due: "2026-03-30 18:00 JST" }))).toThrow(
+      MigrationDataError,
+    );
+  });
+
+  it("止まるときは id と値を挙げる", () => {
+    expect(() => transformOne(legacyRow({ id: 91, due: "2026-03-30oops" }))).toThrow(
+      /#91 due: "2026-03-30oops"/,
+    );
+  });
+
+  it("時刻つきでも日付部分が実在しなければ止まる（2 月 31 日 18:00）", () => {
+    expect(() => transformOne(legacyRow({ due: "2026-02-31 18:00" }))).toThrow(MigrationDataError);
+  });
+
   it("status と done_at の食い違いは値を保ったまま note にする", () => {
     const { input, notes } = transformOne(legacyRow({ status: "todo", done_at: "2026-08-02" }));
     expect(input.status).toBe("todo");

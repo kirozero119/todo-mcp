@@ -4,6 +4,13 @@
  * 開くときは必ず `readOnly: true`。旧 DB は「アーカイブとして凍結する」が地図の
  * 既決事項なので、書ける口を持たないことをコード側で担保する（実測: このフラグ付きの
  * ハンドルへの書き込みは `attempt to write a readonly database` で拒否される）。
+ *
+ * **ここに出てくる `tasks` は旧スキーマのテーブル**（id / title / category / status /
+ * due / created_at / done_at / memo）で、Turso 側の新 `tasks` とは名前が同じだけの別物。
+ * このファイルは `TaskDb` を一切受け取らず `node:sqlite` でローカルファイルを開くだけなので、
+ * 新 DB に文を送る手段を構造的に持たない —— `packages/core/src/tasks.ts` 冒頭の
+ * 「`TaskDb` に対する SQL は全部あそこにある」という不変条件の対象外。
+ * 確認手順そのものは tasks.ts 側の doc コメントに書いてある。
  */
 import { DatabaseSync } from "node:sqlite";
 

@@ -12,6 +12,12 @@
  * カウンタに載らない場合、新規タスクがアーカイブ済みの番号を再利用しうる。
  * 会話 UI で「12 番終わった」と言える設計（03 §5）では、番号の重複は
  * 履歴の取り違えに直結する。
+ *
+ * **Turso がこの 2 文を受けるかは実測済み**（2026-08-08、todo-mcp-dev に対して
+ * `@tursodatabase/serverless` 経由）。`sqlite_sequence` は SQLite の内部テーブルで、
+ * 通常の INSERT / UPDATE は `SQLITE_DBCONFIG_DEFENSIVE` が off のときだけ許される。
+ * dev では UPDATE（値を変える / 変えない）・DELETE・INSERT の 4 通りすべてが通った。
+ * 呼び出し順（INSERT より前に引き上げる）の理由は execute.ts を参照。
  */
 import type { TaskDb } from "@todo-mcp/core";
 

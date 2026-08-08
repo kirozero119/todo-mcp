@@ -28,9 +28,12 @@ packages/server/     Cloudflare Worker: MCP サーバー（Resource Server）+ O
   src/redirect-uri.ts  DCR登録と GET /authorize で共有する redirect_uri ポリシー
 
 packages/migrate/    旧 Python CLI の todos.db → Turso の 1 回きりの移行（Node で走る）
-  src/main.ts        CLI 本体（--target / --dry-run|--execute / --only-open）
-  src/legacy.ts      旧 todos.db の読み出し（readOnly で開く）
+  src/main.ts        I/O シェル（argv / env / 接続 / 出力）
+  src/cli.ts         引数と接続先のガード（純粋関数・テスト対象）
+  src/legacy.ts      旧 todos.db の読み出し（readOnly で開く。ここの tasks は旧スキーマ）
   src/transform.ts   旧 1 行 → 新 1 行の変換規則（純粋関数・テスト対象）
+  src/execute.ts     書き込みの順番（カウンタ先行 → INSERT → 再アサート → 読み直し）
+  src/verify.ts      投入後の値レベル検証（書いたはずの値と DB の実際を全列で突き合わせる）
   src/sequence.ts    sqlite_sequence の引き上げ（tasks 以外を触る唯一の生 SQL）
 ```
 
@@ -71,6 +74,9 @@ turso db show todo-mcp-dev --url        # 出力を .dev.vars の TURSO_DATABASE
 旧 Python CLI（`~/life/todos/todos.db`）のタスクを Turso へ移す。1 回きりの作業だが、
 やり直せることが安全性の中心なので、スクリプトとしてリポジトリに残してある。
 
+**本番に入れるのは生存 8 件のみ**（2026-08-08 決定）。done 140 件は旧 `todos.db` に
+アーカイブとして残す。
+
 ```bash
 # 接続先は target ごとに別の環境変数から取る（共通の TURSO_DATABASE_URL は読まない）
 export TURSO_DEV_DATABASE_URL=$(turso db show todo-mcp-dev --url)
@@ -83,11 +89,51 @@ npm run migrate --workspace @todo-mcp/migrate -- --target dev --dry-run --only-o
 npm run migrate --workspace @todo-mcp/migrate -- --target dev --execute --only-open
 ```
 
+本番（`todo-mcp-prod`）へ入れるときは、prod 用の資格情報を別の変数名で用意して
+`--target prod` を指定する:
+
+```bash
+export TURSO_PROD_DATABASE_URL=$(turso db show todo-mcp-prod --url)
+export TURSO_PROD_AUTH_TOKEN=$(turso db tokens create todo-mcp-prod)
+
+npm run migrate --workspace @todo-mcp/migrate -- --target prod --dry-run --only-open
+npm run migrate --workspace @todo-mcp/migrate -- --target prod --execute --only-open
+```
+
+`TURSO_PROD_DATABASE_URL` のホスト名は `todo-mcp-prod` そのものか `todo-mcp-prod-` で
+始まる必要がある（`todo-mcp-prod2...` のような別 DB は拒否される）。dev の URL を
+貼り間違えていれば、接続する前に止まる。
+
 - `--dry-run` / `--execute` は**どちらかを必ず書く**（既定値は無い）。
-- `--only-open` で done を除く。付けなければ全件（done も含む）。
+- `--only-open` は**必須**。外すと実行前に止まる —— 全件（done 140 件を含む）を入れるには
+  旧 category を `work` / `life` のどちらに載せるかの決定が先に要る。決めたら
+  `packages/migrate/src/cli.ts` の停止を外すこと（その編集自体が判断の記録になる）。
+- `--user-id` は `github:<数値>` 形式のみ。形式違いは接続前に拒否される。
 - 旧 id をそのまま持ち込むので、**同じ対象に 2 回実行すると 1 行目で PRIMARY KEY 制約に当たって
-  止まる**（0 件投入で終わる）。やり直すときは対象 DB を空にしてから。
+  止まる**（0 件投入で終わる）。
 - 移行元は `readOnly` で開く。旧 `todos.db` はアーカイブとして凍結する方針。
+- 投入後は行数の増分だけでなく、**全行を読み直して全 10 列が一致すること**まで確認してから
+  正常終了する。1 列でも食い違えば id と列名を挙げて終了コード 1 で止まる。
+
+### 途中で落ちたときのやり直し
+
+INSERT にトランザクションを張っていないので、途中（ネットワーク断など）で落ちると
+そこまでの行は入ったまま残る。失敗時は必ず `N/M 件を投入済み` と出るので、**その N 件だけを
+消す**。dry-run の計画に id が昇順で並んでいるので、先頭 N 件がその id になる。
+
+```bash
+# 例: 8 件中 3 件まで入って落ちた → 計画の先頭 3 件は id 1, 12, 13
+turso db shell todo-mcp-prod \
+  "DELETE FROM tasks WHERE user_id = 'github:64899536' AND id IN (1, 12, 13);"
+```
+
+対象 DB を丸ごと空にしてはいけない。**部分投入の後に MCP 経由で作られたタスクまで消える**。
+
+- `sqlite_sequence` を手で戻す必要は無い。全行を DELETE しても SQLite はカウンタを
+  リセットしない（実測: 153 のまま）。移行は INSERT より**前**にカウンタを上げるので、
+  途中で落ちた場合でも既に安全域まで上がっている。
+- 「採番カウンタの操作だけが失敗した」というエラーが出た場合は話が別で、**行は全件入っている**。
+  そのときは DB を触らず、`sqlite_sequence(tasks)` の値だけを確認する（エラー文にも書いてある）。
 
 ## 認可の仕組み
 

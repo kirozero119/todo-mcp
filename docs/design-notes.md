@@ -73,6 +73,15 @@
   - [10] `"" → null` の防御は入れたが、実データでは 1 件も発火しなかった
   - [10] 2 回実行すると PRIMARY KEY で止まる（事故防止として機能する）
   - [10] 接続先の取り違えを 2 段で塞ぐ
+  - [10/レビュー] Turso が `sqlite_sequence` への書き込みを受けるかを実測した
+  - [10/レビュー] 採番カウンタを INSERT ループの前に上げる
+  - [10/レビュー] 投入後の検証を値レベルにした（そして何を確かめていないか）
+  - [10/レビュー] `--user-id` を検証しないと、投入後の確認が誤入力を追認する
+  - [10/レビュー] 未知の `due` 形式を丸めるのをやめた
+  - [10/レビュー] `--only-open` を必須にして、全件移行を実行前に止める
+  - [10/レビュー] 取り違えガードを純粋関数に切り出してテストを付けた
+  - [10/レビュー] 「tasks への SQL は core にある」を実行できる形に戻した
+  - [10/レビュー] 本番スコープを 8 件に確定したことで残る限界
 - [todo-tools.ts / todo-format.ts](#todo-toolsts--todo-formatts)
   - [09] user_id を引数から受け取らない構造（withUser）
   - [09] due だけスキーマ検証にしない理由
@@ -609,7 +618,7 @@
 
 **何のために要るか**: `--only-open` では移行しない done の id（最大 153）がカウンタに載らない場合があり、新規タスクがアーカイブ済みの番号を再利用しうる。会話 UI で「12 番終わった」と言える設計（03 §5）では、番号の重複が履歴の取り違えに直結する。引き上げのみ（既存値のほうが大きければ何もしない）にしてあるのは、下げると使用済み id を再発番する DB を作ってしまうため。
 
-**実測**: 旧 id を明示した INSERT で SQLite が自動的にカウンタを 153 まで上げるため、実際にはこの UPDATE は「変更なし」で終わった。それでも残すのは、`--only-open` で最大 id の行が open でないケース（今後 done が増えれば起こる）では自動更新が 153 に届かないため。
+**実測**: 旧 id を明示した INSERT で SQLite が自動的にカウンタを 153 まで上げるため、実際にはこの UPDATE は「変更なし」で終わった。それでも残すのは、`--only-open` で最大 id の行が open でないケース（今後 done が増えれば起こる）では自動更新が 153 に届かないため。**この「変更なしで終わった」ことの意味は [10/レビュー] で改めた** —— 書き込み分岐が一度も実行されていない、ということでもあった。
 
 **ソース位置**: `packages/migrate/src/sequence.ts` の `raiseTaskSequence()`
 
@@ -631,6 +640,8 @@
 
 **射程**: 2 件とも done なので `--only-open`（prod へ移す予定の経路）では 1 件も当たらない。全件移行でのみ発火する。
 
+**丸める範囲**: [10/レビュー] で「先頭 10 文字が日付なら採用」から「`YYYY-MM-DD HH:MM` に完全一致したときだけ」に狭めた。理由はそちらの項に書いた。
+
 **ソース位置**: `packages/migrate/src/transform.ts` の `normalizeDue()`
 
 ### [10] `"" → null` の防御は入れたが、実データでは 1 件も発火しなかった
@@ -645,9 +656,9 @@
 
 **実測**: 同じ対象に `--execute` を 2 回かけると、1 行目（id=1）の INSERT が `SQLITE_CONSTRAINT: UNIQUE constraint failed: tasks.id` で失敗し、`0/8 件を投入済み` と表示して終了コード 1 で止まる。行数も sqlite_sequence も変化しない。旧 id を明示保持する設計の副産物として、二重投入は DB 側で構造的に不可能になっている。
 
-**トランザクションを張っていないことの限界**: 途中の行（例: ネットワーク断で 100 件目）で落ちると、そこまでの行は入ったまま残る。復旧は「対象 DB を空にしてやり直す」で、そのために失敗時は必ず投入済み件数を出す。再実行が上記のとおり必ず 1 行目で止まるので、「部分的に入った状態にもう一度重ねる」事故は起きない。
+**トランザクションを張っていないことの限界**: 途中の行（例: ネットワーク断で 100 件目）で落ちると、そこまでの行は入ったまま残る。復旧は「**移行が投入した id だけを消して**やり直す」で、そのために失敗時は必ず投入済み件数を出す（対象 DB を丸ごと空にする手順は [10/レビュー] で撤回した —— 部分投入の後に MCP 経由で作られたタスクまで消える）。再実行が上記のとおり必ず 1 行目で止まるので、「部分的に入った状態にもう一度重ねる」事故は起きない。
 
-**ソース位置**: `packages/migrate/src/main.ts` の `main()` の INSERT ループ
+**ソース位置**: `packages/migrate/src/execute.ts` の `executeImport()` の INSERT ループ
 
 ### [10] 接続先の取り違えを 2 段で塞ぐ
 
@@ -655,7 +666,118 @@
 
 **モードにも既定値を置かない**: `--dry-run` と `--execute` はどちらか一方が必須で、両方でも片方も無しでもエラー。既定値があると「どちらが既定だったか」を思い出す必要が生まれ、思い出し間違いがそのまま書き込みになる。
 
-**ソース位置**: `packages/migrate/src/main.ts` の `resolveTarget()` / `parseArgs()`
+**ソース位置**: `packages/migrate/src/cli.ts` の `resolveTarget()` / `parseArgs()`（[10/レビュー] で `main.ts` から切り出した）
+
+### [10/レビュー] Turso が `sqlite_sequence` への書き込みを受けるかを実測した
+
+**問題**: `raiseTaskSequence()` の 2 つの書き込み分岐（`INSERT INTO sqlite_sequence` / `UPDATE sqlite_sequence`）は、**Turso に対して一度も実行されていなかった**。dev は明示 id の INSERT で既に `seq=153` になっていたため、常に「変更なし」側だけが走っていた。`sqlite_sequence` は SQLite の内部テーブルで、通常の INSERT / UPDATE は `SQLITE_DBCONFIG_DEFENSIVE` が off のときだけ許される。Turso 側がどう設定しているかはこのリポジトリのどこにも書かれていなかった。
+
+**実測**（2026-08-08、`todo-mcp-dev` に `@tursodatabase/serverless` 経由で発行）:
+
+| 文 | 結果 |
+|---|---|
+| `UPDATE sqlite_sequence SET seq = seq WHERE name='tasks'`（値を変えない） | OK（seq 153 のまま） |
+| `UPDATE sqlite_sequence SET seq = 200 WHERE name='tasks'` | OK（seq 200 に変化） |
+| `DELETE FROM sqlite_sequence WHERE name='tasks'` | OK（行が消える） |
+| `INSERT INTO sqlite_sequence (name, seq) VALUES ('tasks', 153)` | OK（行が戻る） |
+
+つまり Turso は防御モードを有効にしておらず、両分岐とも本番でも通ると期待してよい。dev は実測後 `seq=153` に戻してある。
+
+**残る不確かさ**: これは dev で測った値であり、prod で同じ設定である**保証**はない（同じ組織・同じ group なので同じ設定である蓋然性は高い、という以上のことは言えない）。もし prod で拒否されれば、引き上げは `--execute` の最初の 1 文で失敗し、`SequenceRaiseError(phase: "before")` として「行は 1 件も入っていない」と表示して止まる —— 壊れた状態は作らない。
+
+**ソース位置**: `packages/migrate/src/sequence.ts` の doc コメント
+
+### [10/レビュー] 採番カウンタを INSERT ループの前に上げる
+
+**問題**: `raiseTaskSequence()` の呼び出しが INSERT ループの**後**にあった。ループが途中で落ちる経路はカウンタを上げずに終了する。3 件だけ入って落ちた状態を再現すると `seq=13` になり、**次に MCP 経由で作られるタスクが id 14 を取る**。id 14 は旧 DB に実在するアーカイブ済みタスク（done「レイヤーX社専用の職務経歴書を作成する」）で、sequence.ts 自身が「履歴の取り違えに直結」と書いている事態が静かに起きる。しかも ids 14〜148 がアーカイブのものだと記録している場所が無いので、後から気付いて直すこともできない。露出窓は本番実行そのもの。
+
+**判断**: 引き上げを INSERT より前に移した。SQLite は `seq` を下げないので、先に上げても失うものが無い（153 に上げた後に明示 id=5 を入れても seq は 153 のまま、次の自動発番は 154）。ループ後には**冪等な再アサート**を残してある —— 前段が成功していれば読むだけで終わり、最終値を報告に使える。
+
+**失敗メッセージを分けた理由**: 「カウンタ操作だけが失敗した」は復旧手順が正反対になる。前段の失敗は行が 1 件も入っていない（そのままやり直せる）。後段の失敗は**全行が入っている**（DB を空にしてはいけない）。同じ汎用ハンドラに流すと、README の復旧手順が良いデータを破壊しうる。`SequenceRaiseError` に `phase` を持たせ、ハンドラで別々の文面を出している。
+
+**ソース位置**: `packages/migrate/src/execute.ts` の `executeImport()` / `SequenceRaiseError`
+
+### [10/レビュー] 投入後の検証を値レベルにした（そして何を確かめていないか）
+
+**問題**: 投入後の確認が総件数の増分しか見ていなかった。`created_at` が全行 1 年ずれていても、行数さえ合えば成功終了する。チケット 10 の完了条件は「件数一致、**status 別件数一致**、**期限付きタスクの欠落なし**」で、増分だけでは満たせない。
+
+**対応**: 投入した全行を `getTask()` で 1 件ずつ読み直し、`ImportTaskInput` と全 10 列（id / workspace / project / title / status / due / memo / created_at / updated_at / closed_at）を突き合わせる。食い違った列は id と列名を挙げて `ImportVerificationError` で止める。`getTask()` は user_id で絞るので、**間違った user_id で書かれた行は「読み直しても行が無い」として検出される**（user_id 列も実質ここで見ている）。
+
+**この検証が答えられない問い**: 「旧 DB と一致するか」。`transformRow()` が値を取り違えていれば、その間違った値が「書いたはずの値」になるので、ここは一致してしまう。変換の正しさは `packages/migrate/test/transform.test.ts` の管轄で、**両方が揃って初めて「旧 DB → Turso」の経路全体が担保される**。片方だけを見て「検証済み」と言わないこと。
+
+**なぜ core の読み取り関数を使うのか**: 「このスクリプトが書いた行を、このスクリプトで読み直す」形なのは承知のうえ。ここで確かめたいのは「core の書き込み関数が、渡した値をそのまま保存したか」であり、それには core の読み取り経路が正しい相手になる（生 SQL を書けば `tasks.ts` の不変条件が壊れる）。
+
+**往復回数**: 1 行 1 往復。本番スコープは 8 行なので問題にならない。全件（148 行）を入れる判断をするなら、ここは `searchTasks` の一括読みに変えるか、往復を承知で残すかを決め直すこと。
+
+**ソース位置**: `packages/migrate/src/verify.ts` の `diffImportedTask()` / `verifyImported()`
+
+### [10/レビュー] `--user-id` を検証しないと、投入後の確認が誤入力を追認する
+
+**問題**: `--workspace` は `workspaceSchema` を通すのに `--user-id` は任意の文字列を受けていた（非対称）。名前空間を欠いた値（`64899536`）や別ユーザーの値を渡すと、全行が誰にも見えないスコープへ入る。しかも**投入後の確認も同じ指定値で検索する**ので、増分は一致して成功扱いになる —— 誤入力を検証が自分で追認する形。
+
+**対応**: `/^github:\d+$/` に一致しない値を接続前に拒否する。この形は 08 で確定した canonical identity で、`packages/server/src/allowlist.ts` の `githubUserId()` が作る形と同じ。
+
+**ソース位置**: `packages/migrate/src/cli.ts` の `USER_ID_FORMAT`
+
+### [10/レビュー] 未知の `due` 形式を丸めるのをやめた
+
+**問題**: `normalizeDue()` が「先頭 10 文字が有効な日付なら採用」していたので、`2026-03-30oops` のような**有効な日付で始まる不正値**が正常な due として静かに投入される。transform.ts 全体の方針（判断できない値は握りつぶさず止める）と矛盾していた。
+
+**対応**: 丸めるのは旧形式として実在を確認済みの `YYYY-MM-DD HH:MM`（#91 / #92）だけにし、正規表現を全体一致にした。それ以外は `MigrationDataError` で id と値を挙げて停止する。日付部分が実在しない（`2026-02-31 18:00`）場合も止まる。
+
+**ソース位置**: `packages/migrate/src/transform.ts` の `LEGACY_DUE_WITH_TIME` / `normalizeDue()`
+
+### [10/レビュー] `--only-open` を必須にして、全件移行を実行前に止める
+
+**問題**: `--only-open` を外すと done 140 件を含む全行が**単一の `--workspace` 値**で入る。旧 category には `PKSHA` 4 / `work` 5 / `ラクス` 5 / `ナウキャスト` 4 / `Rox Products` 2 が混ざっており、03 §2 の境界では `work` に落ちるものがある。しかも PKSHA でも 2026-05-01 入社前の行は転職活動＝私事なので、機械的に割り切れない。
+
+**確定事項**（2026-08-08 松本さん決定）: 本番へは `--only-open` の 8 件のみ。done 140 件は旧 `todos.db` にアーカイブとして残す。全件移行は今回やらない。
+
+**判断**: `--only-open` を必須引数にし、無ければ `parseArgs()` の段階で（`--dry-run` でも）止める。停止メッセージに「全件移行には category → workspace のマッピング決定が要る」と理由を書いた。dry-run も止めるのは、全件の下見それ自体が同じ判断を必要とするから。**この停止を外すこと自体が「マッピングを決めた」という判断の記録になる**、という形にしてある。
+
+**ソース位置**: `packages/migrate/src/cli.ts` の `parseArgs()`
+
+### [10/レビュー] 取り違えガードを純粋関数に切り出してテストを付けた
+
+**問題**: `--target` と URL ホスト名の照合、`--dry-run` / `--execute` の必須化 —— **誤って本番に書くのを止める仕組みそのもの**に自動テストが 1 本も無かった。`parseArgs` / `resolveTarget` が `main.ts` のモジュール private で、テストから import できない形だったため。`vitest.config.ts` は省略を意図的と書いていたが、その理由（「実 DB に触る部分」）はこの 2 つの純粋関数には当てはまらない。
+
+**対応**: `packages/server/src/allowlist.ts` / `redirect-uri.ts` と同じ「純粋なガード + I/O シェル」の形に揃え、`cli.ts` に切り出した。`resolveTarget()` は `process.env` を読まず `env` を引数で受ける（両方向の貼り間違いをテストから直接与えられる）。
+
+**ホスト照合の形**: `host !== expected && !host.startsWith(expected + "-")`。`||` に変えるとホスト名がちょうど `todo-mcp-prod` の DB を拒否し、`startsWith(expected)` だけにすると `todo-mcp-prod2.turso.io` のような別 DB を通す。この 2 つは別々のテストで押さえてある（変異を入れるとそれぞれ落ちる）。
+
+**ソース位置**: `packages/migrate/src/cli.ts`、`packages/migrate/test/cli.test.ts`
+
+### [10/レビュー] 「tasks への SQL は core にある」を実行できる形に戻した
+
+**問題**: `tasks.ts` 冒頭は「tasks テーブルに対する SQL は全部ここにある」と書いていたが、10 で `legacy.ts` に **core 外・`user_id` 条件なしの `FROM tasks`** が 3 箇所入った。旧 todos.db のテーブル名も `tasks` なので、リポジトリ全体の grep はこの不変条件を確認できなくなった。09 で「機械的な確認がテストより先に穴を見つけた」道具を、10 が鈍らせた形。
+
+**言明の作り直し**: 新旧を分ける軸は「`TaskDb`（新 DB のハンドル）を受け取るか」。`legacy.ts` は `node:sqlite` でローカルファイルを開くだけで `TaskDb` を受け取らないので、新 DB に文を送る手段を構造的に持たない。`sequence.ts` は `TaskDb` を受け取るが `sqlite_sequence` しか触らない。よって言明は「**`TaskDb` を受け取るファイルのうち、新 tasks への SQL を持つのは `packages/core/src/tasks.ts` ただ 1 つ**」になる。
+
+**確認手順を 2 本の grep にした**（tasks.ts の doc コメントに全文がある）:
+
+```
+$ grep -rEln '(FROM|INTO|UPDATE) tasks' packages --include='*.ts' --exclude-dir=test --exclude-dir=node_modules
+packages/core/src/tasks.ts
+packages/migrate/src/legacy.ts
+
+$ grep -n 'import .*TaskDb' packages/migrate/src/legacy.ts
+（出力なし）
+```
+
+**2 本目で一度間違えた**: 最初は `grep -l TaskDb packages/migrate/src/legacy.ts` と書いたが、legacy.ts に足した「`TaskDb` を一切受け取らない」という説明文自体が `TaskDb` という語を含むため、常にヒットして手順が成り立たなかった（実行して気付いた）。判定したいのは「受け取るか」＝ import の有無なので、そちらを見る形に直した。
+
+**さらにテストにした**: doc コメントは古びるし、上のように手順そのものを間違えもする。同じ判定を `packages/core/test/invariants.test.ts` で実行し、`TaskDb` と tasks への SQL を同時に持つファイルが現れたら落ちるようにした（判定はコメントを落としてから行うので、legacy.ts の doc コメント中の `TaskDb` という語には反応しない）。
+
+**ソース位置**: `packages/core/src/tasks.ts` 冒頭、`packages/migrate/src/legacy.ts` 冒頭、`packages/core/test/invariants.test.ts`
+
+### [10/レビュー] 本番スコープを 8 件に確定したことで残る限界
+
+本番へ入れるのは生存 8 件のみで、done 140 件は旧 `todos.db` にアーカイブとして残す（2026-08-08 決定）。この決定が残す限界を、後から掘り返さなくて済むように書いておく。
+
+- **後から done を追記する経路は無い**。`--skip-existing`（既存 id を飛ばして残りを入れる）を足す案は採らなかった —— 本番スコープが確定した以上、移行スクリプトに**未検証のコード経路を増やす**ほうが危ない。後から done も欲しくなった場合は「prod を DELETE して全件やり直す」で、松本さんはこれを承知のうえで選んでいる。そしてそのやり直しには、上記の category → workspace マッピング決定が先に要る。
+- **`updated_at < closed_at` の歪みは是正していない**。`--only-open` では該当 0 件（全件だと 114/148）。全件を入れる判断をするときに、`MAX(created_at, closed_at)` に直すか歪みを承知で残すかを決め直すこと。
+- **`due_time_dropped` は 8 件では発火しない**。該当の #91 / #92 はどちらも done。
+- **`empty_to_null` も 8 件では発火しない**（旧 DB に空文字が 0 件）。防御が生きていることはテストでのみ固定されている。
 
 ---
 

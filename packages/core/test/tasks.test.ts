@@ -5,6 +5,7 @@ import {
   completeTask,
   createTask,
   getTask,
+  importTask,
   listOpenTaskIds,
   listOpenTasks,
   searchTasks,
@@ -99,6 +100,109 @@ describe("workspace 絞り込み", () => {
 
     expect(await listOpenTaskIds(db, { userId: ME })).toEqual([work.id, life.id]);
     expect(await listOpenTaskIds(db, { userId: ME, workspace: "work" })).toEqual([work.id]);
+  });
+});
+
+/**
+ * importTask（移行専用）。createTask には無い 3 つの権限——id を指定する /
+ * タイムスタンプを過去の値にする / closed_at を status から導出しない——が
+ * ちゃんと効いていること、そして `""` の正規化がここでも同じであること。
+ *
+ * 公開面に出ているのに検証もテストも無かった。MCP ツールからは到達できないが、
+ * 到達できないことは「壊れても気付かなくてよい」ことを意味しない ——
+ * 唯一の呼び出し元（packages/migrate）が本番データを 1 回きりで書き込む経路にある。
+ */
+describe("importTask（移行専用の INSERT）", () => {
+  const LEGACY = {
+    userId: ME,
+    id: 153,
+    workspace: "life" as const,
+    project: "移住",
+    title: "旧 DB から来たタスク",
+    status: "someday" as const,
+    due: "2026-08-14",
+    memo: "覚え書き",
+    createdAt: "2026-03-30T00:00:00Z",
+    updatedAt: "2026-03-30T00:00:00Z",
+    closedAt: null,
+  };
+
+  it("旧 id をそのまま使う（発番させない）", async () => {
+    const task = await importTask(db, LEGACY);
+    expect(task.id).toBe(153);
+    expect((await getTask(db, { userId: ME, id: 153 }))?.title).toBe("旧 DB から来たタスク");
+  });
+
+  it("タイムスタンプは「今」ではなく渡した値が verbatim で入る", async () => {
+    const task = await importTask(db, {
+      ...LEGACY,
+      status: "done",
+      createdAt: "2026-03-30T00:00:00Z",
+      updatedAt: "2026-03-30T00:00:00Z",
+      closedAt: "2026-03-31T00:00:00Z",
+    });
+    expect(task.created_at).toBe("2026-03-30T00:00:00Z");
+    expect(task.updated_at).toBe("2026-03-30T00:00:00Z");
+    // closed_at は status から導出しない。移行元の値をそのまま置く。
+    expect(task.closed_at).toBe("2026-03-31T00:00:00Z");
+  });
+
+  it("status が done でも closed_at が null なら null のまま（導出しない）", async () => {
+    const task = await importTask(db, { ...LEGACY, status: "done", closedAt: null });
+    expect(task.status).toBe("done");
+    expect(task.closed_at).toBeNull();
+  });
+
+  it("空文字は project / memo / due / closed_at のどれでも null になる", async () => {
+    const task = await importTask(db, {
+      ...LEGACY,
+      project: "",
+      memo: "",
+      due: "",
+      closedAt: "",
+    });
+    expect(task.project).toBeNull();
+    expect(task.memo).toBeNull();
+    expect(task.due).toBeNull();
+    expect(task.closed_at).toBeNull();
+
+    // 書けるのに読めない行にならないこと（`""` は表示にも project 絞り込みにも出ない）。
+    const readBack = await getTask(db, { userId: ME, id: LEGACY.id });
+    expect(readBack).toEqual(task);
+  });
+
+  it("省略された null 可の列も null で入る", async () => {
+    const task = await importTask(db, {
+      userId: ME,
+      id: 1,
+      workspace: "life",
+      title: "最小構成",
+      status: "todo",
+      createdAt: T0,
+      updatedAt: T0,
+    });
+    expect(task).toEqual({
+      id: 1,
+      workspace: "life",
+      project: null,
+      title: "最小構成",
+      status: "todo",
+      due: null,
+      memo: null,
+      created_at: T0,
+      updated_at: T0,
+      closed_at: null,
+    });
+  });
+
+  it("user_id は他人のスコープに漏れない（別 user からは見えない）", async () => {
+    await importTask(db, LEGACY);
+    expect(await getTask(db, { userId: SOMEONE_ELSE, id: 153 })).toBeNull();
+  });
+
+  it("同じ id を 2 回入れると PRIMARY KEY で落ちる（二重投入は構造的に不可能）", async () => {
+    await importTask(db, LEGACY);
+    await expect(importTask(db, LEGACY)).rejects.toThrow(/UNIQUE constraint failed/);
   });
 });
 
