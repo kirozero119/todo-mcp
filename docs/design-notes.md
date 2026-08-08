@@ -50,6 +50,8 @@
   - mcpApiHandler を ExportedHandler 形状でラップする理由
   - [09] env をファクトリに渡す経路がないので deps をカリー化した
   - [09] Turso 未設定のとき 500 ではなく openDb で投げる理由
+  - [09/レビュー] types.ts / turso.ts のコメントを実装に合わせて訂正した
+  - [09/レビュー] 不正な `?workspace=` クエリ値をエラー文にエコーする
 - [packages/core](#packagescore)
   - [09] core / server の境界をどこで切ったか
   - [09] user_id スコープを「grep で確認できる」形に保つ
@@ -57,12 +59,18 @@
   - [09] 書き込みを全部 RETURNING にした理由と往復回数
   - [09] COUNT(*) OVER () で総件数と先頭 N 件を 1 往復で取る
   - [09] 読み出し時に Zod 検証をしない
+  - [09/レビュー] completeTask の冪等性を UPDATE の WHERE 句自体で守る（同時実行対策）
+  - [09/レビュー] updateTask の SELECT→UPDATE は非トランザクション —— 許容している理由
 - [todo-tools.ts / todo-format.ts](#todo-toolsts--todo-formatts)
   - [09] user_id を引数から受け取らない構造（withUser）
   - [09] due だけスキーマ検証にしない理由
   - [09] ToolText を interface ではなく type にした理由
   - [09] プロトタイプから変えた点（agenda フッターの文言）
   - [09] ツール呼び出しログに載せるもの・載せないもの
+  - [09/レビュー] upsert_task の not-found アンカーを workspace で絞らない
+  - [09/レビュー] search_tasks の 0 件時のスコープ表示を実効検索条件に合わせる
+  - [09/レビュー] title / project / query の空文字をスキーマ側で弾く
+  - [09/レビュー] 表示層・ツール層に DB 不要の単体テストを追加した
 - [github.ts](#githubts)
   - GitHub 認可 URL に scope を一切渡さない理由
   - GitHub の token エンドポイントはエラーも HTTP 200 で返す
@@ -411,6 +419,22 @@
 
 **ソース位置**: `mcp.ts` の `tursoOpener()`、`turso.ts` の `tursoConfigFromEnv()`
 
+### [09/レビュー] types.ts / turso.ts のコメントを実装に合わせて訂正した
+
+**問題**: `types.ts` の `Env.TURSO_DATABASE_URL` フィールドコメントに「欠けている場合は 500 で落とす」、`turso.ts` の `tursoConfigFromEnv()` のコメントに「呼び出し側（mcp.ts）は 500 で明示的に失敗させる」という記述が残っていた。しかし実装（`mcp.ts` の `tursoOpener()`）は 500 を返さない —— DB 未設定時は `openDb()` 呼び出し時に例外を投げ、ツールハンドラ内の例外は SDK が `isError` のツール結果に変換する。`whoami` や `tools/list` は Turso に触れないためこの経路を通らず生存する。README や本ドキュメントの直上の項目（「[09] Turso 未設定のとき 500 ではなく openDb で投げる理由」）は正しい挙動を書いていたが、この 2 箇所のソースコメントだけが設計変更前の痕跡として矛盾したまま残っていた。
+
+**対応**: 両コメントを「DB を触るツールだけが isError で失敗する。whoami / tools/list は生存する」という実装済みの挙動に揃えて書き直した。
+
+**ソース位置**: `packages/server/src/types.ts`（`Env.TURSO_DATABASE_URL` のコメント）、`packages/server/src/turso.ts`（`tursoConfigFromEnv()` のコメント）
+
+### [09/レビュー] 不正な `?workspace=` クエリ値をエラー文にエコーする
+
+**問題**: `resolveDefaultWorkspace()` は `"work"/"life"` の厳密比較に外れた値をすべて `undefined`（＝「未指定」）に潰していた。接続 URL が `?workspace=lif` のようなタイプミスのとき、後続のツール呼び出しで workspace が未解決になっても、エラー文は「workspace=(未指定)」としか言えず、①本当にクエリを付け忘れているのか ②クエリはあるがタイプミスなのか、を区別できなかった。06 で確定したエラー文の 3 部品（①不正値のエコー ②期待する形式 ③アンカー）のうち①を満たしていない。
+
+**対応**: `resolveDefaultWorkspace()` の戻り値を `Workspace | undefined` から `{ workspace, invalidValue }` に変え、「クエリ自体が無い」（`invalidValue: undefined`）と「クエリはあるが不正」（`invalidValue: <生の値>`）を区別して保持する。`TodoToolDeps.invalidWorkspaceQuery` として `todo-tools.ts` まで運び、`workspaceMissingError()` がこれを受け取って、値があれば `不正な値: workspace="lif"` のように実際に来た値をエコーし、無ければ従来通り「未指定」の文言を出す。期待する形式（"work" または "life"）と回復手順（URL の `?workspace=` を直す / ツール引数で明示する）は 3 部品構成のまま維持し、①だけを実効化した。有効な値（"work"/"life"）が来た場合の挙動は変えていない。
+
+**ソース位置**: `packages/server/src/mcp.ts` の `resolveDefaultWorkspace()`。エラー文の組み立ては `packages/server/src/todo-format.ts` の `workspaceMissingError()`、運搬経路は `packages/server/src/todo-tools.ts` の `TodoToolDeps.invalidWorkspaceQuery`
+
 ---
 
 ## packages/core
@@ -452,7 +476,7 @@
 
 **対応**: `INSERT ... RETURNING` / `UPDATE ... RETURNING` を使い、書いた行をその場で受け取る。結果として `TaskDb` に `run()` が不要になり、面が `all()` / `get()` の 2 つに減った。
 
-**現在の往復回数**: 作成 1 / 更新 2（現在値の SELECT → UPDATE）/ 完了 2（同）/ 一覧・検索・詳細 各 1。更新系が 2 なのは、応答に「実際に変わった列」を出すために変更前の値が要るから。この差分表示は、AI が同じ更新を繰り返したときに人間が気付ける唯一の手掛かりなので、1 往復と引き換えに残している。
+**現在の往復回数**: 作成 1 / 更新 2（現在値の SELECT → UPDATE）/ 完了 1（UPDATE のみ。ただし id が存在しない・既に done だった場合は UPDATE 0 行 → 読み直しで 2）/ 一覧・検索・詳細 各 1。更新系が 2 なのは、応答に「実際に変わった列」を出すために変更前の値が要るから。この差分表示は、AI が同じ更新を繰り返したときに人間が気付ける唯一の手掛かりなので、1 往復と引き換えに残している。完了が 1 に減ったのは、後述の「[09/レビュー] completeTask の冪等性を UPDATE の WHERE 句自体で守る」で SELECT→UPDATE の順序をやめたため。
 
 **ソース位置**: `packages/core/src/tasks.ts` の `createTask()` / `updateTask()` / `completeTask()`
 
@@ -471,6 +495,28 @@
 **対応**: `taskFromRow()` は Zod を通さず、素の型付きマッパーにしてある。1 行の不正値のために一覧全体が例外で落ちる代償のほうが大きい。検証は「書き込みの入口」に置く、が 03 の設計であり、入口は MCP と CLI の 2 つだけで、どちらもこのパッケージの Zod enum を通る。
 
 **ソース位置**: `packages/core/src/schema.ts` の `taskFromRow()`
+
+### [09/レビュー] completeTask の冪等性を UPDATE の WHERE 句自体で守る（同時実行対策）
+
+**問題**: 実装当初の completeTask は「SELECT で現在の status を確認 → done でなければ UPDATE」という順序だった（updateTask と同じ read-then-write の形）。2 台のクライアントがほぼ同時に同じタスクを complete すると、両方の SELECT が「まだ done ではない」を読み、両方が無条件の UPDATE を実行してしまう。後勝ちの UPDATE が先勝ちの closed_at を上書きしたうえ、両方が `alreadyDone: false`（＝「今回自分が完了させた」）と応答する。07 が定めた冪等性（既に done なら「変更なし」と応答する）が、同時実行下では破れる具体例。
+
+**対応**: 「読んでから書く」を「書きながら条件を見る」に変えた。UPDATE の WHERE 句に `AND status != 'done'` を足し、`alreadyDone` の判定を「事前 SELECT の結果」ではなく「UPDATE が行を返したかどうか」に付け替えた。UPDATE が 0 行だった場合だけ、getTask で読み直して「そもそも存在しない（他人の行を含む）」のか「既に done だった」のかを区別する。この形なら、同時に 2 本の complete_task が来ても、先にコミットした 1 本だけが行を更新し、後続は WHERE 句が一致せず 0 行で終わる（＝素直に alreadyDone になる。closed_at は先にコミットした側の値のまま）。
+
+**波及**: 正常系（まだ done ではないタスクを complete する）の往復回数が 2（SELECT → UPDATE）から 1（UPDATE のみ）に減った。往復が増えるのは「id が存在しない」または「既に done だった」場合の 2 パターンだけ。「[09] 書き込みを全部 RETURNING にした理由と往復回数」の記述もこれに合わせて更新した。
+
+**検証**: `packages/core/test/tasks.test.ts` に、`Promise.all` で同じ id への 2 本の completeTask を並べて走らせるテストを追加した。テストが使う node:sqlite 版 TaskDb は `db.all()`/`db.get()` の中身が同期実行を `Promise.resolve()` で包んだだけなので、`Promise.all` の評価順によって「両方の UPDATE が、どちらの結果も読まれるより先に逐次実行される」形に決定的になり、read-then-write レースをこの in-memory DB 上で再現できる。旧実装（SELECT→UPDATE）でこのテストを走らせると、両方が `alreadyDone: false` を返し（「今回完了した」の件数が 1 本ではなく 2 本になる）、想定と食い違って落ちることを確認した。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `completeTask()`。テストは `packages/core/test/tasks.test.ts`
+
+### [09/レビュー] updateTask の SELECT→UPDATE は非トランザクション —— 許容している理由
+
+**問題**: completeTask と違い、updateTask の「先に SELECT して差分を取る → UPDATE」という形は今回直していない。理由は差分表示（`changed`）の仕組みごと作り替えになるため——07 が定めた「実際に変わった列を返す」という応答形が、この事前 SELECT に依存している（「[09] 書き込みを全部 RETURNING にした理由と往復回数」参照）。したがって updateTask には completeTask と同種の read-then-write の隙間が残ったままである。
+
+**実際の限界**: 2 台が同時に同じタスクを異なるフィールドで更新すると、後勝ちの UPDATE が計算する `assignments`（変更差分）は自分が読んだ古い `current` を基準にしているため、応答の `changed` が「実際に他方の変更を踏まえた差分」ではなく「自分が読んだ時点からの差分」になりうる。
+
+**それでも壊れないもの**: status と closed_at は常に同一の UPDATE 文の中で一緒に書かれる（status 専用の分岐が `assignments.push("status = ?", "closed_at = ?")` を同時に積む）。そのため、同時実行があっても「status=done なのに closed_at=null」のような矛盾した中間状態を作ることはできない —— 最終的にどちらが勝っても、勝った側が送った status と closed_at のペアがそのまま反映されるだけ。
+
+**ソース位置**: `packages/core/src/tasks.ts` の `updateTask()`
 
 ---
 
@@ -521,6 +567,38 @@
 **載せないもの**: `title` と `memo`。個人のタスク本文が Workers のログに残るのを避ける。載せるのはツール名・解決後の workspace・id・結果の種別（作成/更新/変更列名/not_found など）だけで、これで「どのツールがどう呼ばれたか」は追える。
 
 **ソース位置**: `mcp.ts` の `resolveRequestId()`、`todo-tools.ts` の `log()`
+
+### [09/レビュー] upsert_task の not-found アンカーを workspace で絞らない
+
+**問題**: upsert_task の更新経路（id 指定）で not-found になったとき、実在する open id の一覧（アンカー）を `listOpenTaskIds(db, { userId, workspace: resolveWorkspace(args.workspace) })` という、workspace で絞った形で取っていた。しかし `args.workspace` はこの呼び出しにおいて「移動先として設定したい値」であって、探索用のレンズではない。id を打ち間違えたとき、正解の id が別 workspace にあると、そのアンカーから欠落してしまい、モデルが自己修正できない。
+
+**対応**: get_task・complete_task と同じく `listOpenTaskIds(db, { userId })`（workspace 指定なし、全 workspace 対象）に揃えた。id しか手がかりがないツール呼び出しでは、どちらの workspace の話か決め打ちできないので、探索は常に全 workspace で行う、という原則を 3 ツールで統一した。
+
+**ソース位置**: `todo-tools.ts` の `upsert_task` ハンドラ（更新経路の not-found 分岐）
+
+### [09/レビュー] search_tasks の 0 件時のスコープ表示を実効検索条件に合わせる
+
+**問題**: `buildSearchResult()` の 0 件メッセージは `include_closed` だけを見て「open のみ」/「closed 含む」を出し分けていた。しかし core 側の `searchTasks()` は `status` 指定があればそれを優先し `includeClosed` を無視する分岐になっている（`if (params.status) {...} else if (!params.includeClosed) {...}`）。この非対称性が formatter に伝わっていなかったため、`status: "done"` を指定して 0 件のときに「open のみ。done / cancelled も探すには include_closed: true」という、実際の検索条件と矛盾する案内を出してしまっていた（status を優先しているのに、まだ include_closed を勧める）。逆に status を open 値に絞りつつ `include_closed: true` のときは、実際より広いスコープを表示していた。
+
+**対応**: formatter が受け取る引数を `includeClosed` 単体から `{ status, includeClosed }`（実際に SQL が使った実効条件）に変えた。0 件時のスコープ表示は「status 指定があればそれ」「なければ includeClosed の有無」で組み立て、SQL の分岐と 1 対 1 に対応させる。`include_closed: true` への誘導文は「status 未指定 かつ includeClosed が false」のとき —— つまり実際に `include_closed: true` にすることで検索範囲が広がる場合 —— だけ出す。status 指定時や、すでに `includeClosed: true` のときは、オンにしても結果が変わらないので誘導しない。
+
+**ソース位置**: `todo-format.ts` の `buildSearchResult()`（呼び出し元は `todo-tools.ts` の `search_tasks` ハンドラ）
+
+### [09/レビュー] title / project / query の空文字をスキーマ側で弾く
+
+**問題**: `upsertTaskInput` の `title` は更新経路（id あり）では一切検証されていなかった。`upsert_task(id: 12, title: "")` を呼ぶと `updateTask()` の `setIfChanged` が空文字を「現在値と違う」として素直に書き込み、一覧表示が `#12 [todo] ` になって可読性とモデルの参照性を壊す。同様に `searchTasksInput` の `project` / `query` は空文字を許していたため、`if (params.project)` / `if (params.query)`（core 側 `searchTasks()`）が空文字を falsy として無視し、絞ったつもりのフィルタが黙って外れ、全件を返す「絞れていないのに絞れた顔をする」応答になっていた。
+
+**対応**: `title` を `z.string().min(1).optional()`、`project` / `query` を `z.string().min(1).optional()` に変えた。空文字は SDK のスキーマ検証段階で弾かれ、モデルには自動生成された Input validation error が isError で返る。due と違い、この 3 フィールドのエラー文には「今日」のような呼び出し時にしか分からない値を注入する必要がない（「[09] due だけスキーマ検証にしない理由」参照）ため、素直に Zod 側へ寄せられる。
+
+**ソース位置**: `todo-tools.ts` の `upsertTaskInput` / `searchTasksInput`。`titleRequiredError()` の文言も「title=(未指定)」から「title=(未指定または空)」に更新した（`todo-format.ts`）
+
+### [09/レビュー] 表示層・ツール層に DB 不要の単体テストを追加した
+
+**問題**: `buildAgenda()`（このサーバーで一番複雑な分類ロジック）の担保が手動スモーク 1 回だけだった。「server の tsconfig には node 型がなく node:sqlite の in-memory DB が使えない」という制約（「[09] TaskDb を最小インターフェースにして node:sqlite でテストする」参照）は、DB を実際に触るテスト（クエリ関数のテスト）にしか当てはまらない。`buildAgenda()` / `buildSearchResult()` / `openIdsAnchor()` は Task の配列とプリミティブしか受け取らない純関数であり、この制約の対象外。
+
+**対応**: `packages/server/test/todo-format.test.ts` を新設し、buildAgenda のセクション境界（期限切れ / 今日が期限 / horizon ちょうど / horizon+1 の除外 / someday に due がある行の除外 / 進行中・待ちの期限なし判定）とフッター件数の内訳、buildSearchResult の 0 件時スコープ表示と絞り込み誘導行、openIdsAnchor の 20 件超過時の挙動を直接テストした。あわせて `packages/server/test/mcp.test.ts` に、素の `all`/`get` だけを持つ fake TaskDb（node:sqlite ではない）を注入した get_agenda 呼び出しを追加し、`?workspace=` の URL 既定値とツール引数 workspace の優先順位（引数が常に勝つ）を実際のツール呼び出し経由で検証した。
+
+**ソース位置**: `packages/server/test/todo-format.test.ts`（新設）、`packages/server/test/mcp.test.ts` の `get_agenda workspace resolution ([09])`
 
 ---
 

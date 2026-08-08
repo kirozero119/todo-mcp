@@ -26,7 +26,8 @@ export interface Env {
 
   /**
    * Turso の接続先。dev（`todo-mcp-dev`）と本番（`todo-mcp-prod`）で別の DB を指す。
-   * 欠けている場合は 500 で落とす（理由は turso.ts）。
+   * 欠けている場合、DB を触るツールだけが isError で失敗する
+   * （whoami / tools/list は生存する。理由は turso.ts / docs/design-notes.md）。
    */
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;

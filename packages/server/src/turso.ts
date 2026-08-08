@@ -14,7 +14,9 @@ import type { Env } from "./types";
  *
  * 欠けたまま既定値で動かしたりしない。「DB に繋がらないが 200 を返す Todo
  * サーバー」は、タスクが 0 件あるのと見分けがつかず、モデルが「何もない」と
- * 人間に報告してしまう。呼び出し側（mcp.ts）は 500 で明示的に失敗させる。
+ * 人間に報告してしまう。呼び出し側（mcp.ts の tursoOpener）は、DB に触る
+ * ツールが呼ばれた時点で例外を投げて明示的に失敗させる。whoami / tools/list
+ * はこの例外を経由しないため生存する（詳細は docs/design-notes.md）。
  */
 export function tursoConfigFromEnv(env: Partial<Env>): TursoConfig | undefined {
   const url = env.TURSO_DATABASE_URL?.trim();

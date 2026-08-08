@@ -204,24 +204,40 @@ export interface CompleteTaskResult {
   alreadyDone: boolean;
 }
 
-/** done 専用。冪等 —— 既に done なら何も書かずに現状を返す。 */
+/**
+ * done 専用。冪等 —— 既に done なら何も書かずに現状を返す。
+ *
+ * 「既に done か」の判定を UPDATE の WHERE 句自体（`AND status != 'done'`）に
+ * 持たせている。事前の SELECT で確認してから UPDATE する形（先に読む→後で書く）
+ * だと、2 台から同時に complete したとき両方が「まだ done ではない」を読み、
+ * 後勝ちの UPDATE が先勝ちの closed_at を上書きしたうえで両方が「今回 done に
+ * した」と応答してしまう（07 が定めた冪等性が同時実行下で破れる）。
+ * `AND status != 'done'` により、2 本目の UPDATE は対象行 0 件で終わる
+ * （1 本目が先にコミットして status を 'done' に変えているため）。
+ *
+ * `alreadyDone` は SELECT の結果ではなく「UPDATE が行を返したかどうか」で決める。
+ * UPDATE が 0 行だった場合だけ、「そもそも存在しない（他人の行を含む）」のか
+ * 「既に done だった」のかを区別するために getTask で読み直す。
+ */
 export async function completeTask(
   db: TaskDb,
   params: UserScope & { id: number; now?: string },
 ): Promise<CompleteTaskResult | null> {
-  const current = await getTask(db, { userId: params.userId, id: params.id });
-  if (!current) return null;
-  if (current.status === "done") return { task: current, alreadyDone: true };
-
   const timestamp = params.now ?? nowIso();
   const rows = await db.all(
     `UPDATE tasks SET status = 'done', closed_at = ?, updated_at = ?
-      WHERE user_id = ? AND id = ?
+      WHERE user_id = ? AND id = ? AND status != 'done'
       RETURNING ${TASK_COLUMNS}`,
     [timestamp, timestamp, params.userId, params.id],
   );
   const row = rows[0];
-  return row ? { task: taskFromRow(row), alreadyDone: false } : null;
+  if (row) return { task: taskFromRow(row), alreadyDone: false };
+
+  const current = await getTask(db, { userId: params.userId, id: params.id });
+  if (!current) return null;
+  // ここに来た時点で status は既に 'done'（他人の行なら getTask 自体が null
+  // を返している）。closed_at は最初に完了した時刻のまま。
+  return { task: current, alreadyDone: true };
 }
 
 export interface SearchTasksParams extends UserScope {

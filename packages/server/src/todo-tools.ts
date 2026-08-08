@@ -57,6 +57,13 @@ export interface TodoToolDeps {
    * ツール引数の workspace が来たら、そちらが常に勝つ。
    */
   defaultWorkspace: Workspace | undefined;
+  /**
+   * 接続 URL に `?workspace=` は付いていたが "work"/"life" のどちらでもなかった
+   * 場合の生値。クエリ自体が無い場合は undefined（[09] 参照）。
+   * workspaceMissingError() がこれを見て、エラー文を「未指定」と「不正値」で
+   * 出し分ける。
+   */
+  invalidWorkspaceQuery: string | undefined;
   /** ログ 1 行に載せるリクエスト識別子（07 の反省: 呼び出しの帰属を追えるように）。 */
   requestId: string | undefined;
 }
@@ -84,7 +91,10 @@ const getTaskInput = z.object({
 
 const upsertTaskInput = z.object({
   id: z.number().int().optional().describe("更新対象のタスク番号（例: 12）。省略で新規作成"),
-  title: z.string().optional().describe("タスクの内容（新規作成時は必須）"),
+  // .min(1): 更新経路（id あり）は元々ここ以外で title を検証していなかった。
+  // 空文字を通すと `upsert_task(id, title: "")` が空タイトル行を作れてしまい、
+  // 一覧表示が `#12 [todo] ` になって可読性とモデルの参照性を壊す（[09] 参照）。
+  title: z.string().min(1).optional().describe("タスクの内容（新規作成時は必須）"),
   workspace: workspaceSchema.optional().describe(WS_DESC),
   project: z
     .string()
@@ -101,10 +111,12 @@ const completeTaskInput = z.object({
 });
 
 const searchTasksInput = z.object({
-  query: z.string().optional().describe("title / memo の部分一致キーワード"),
+  // .min(1): 空文字は `if (params.project)` / `if (params.query)`（core 側）で
+  // 黙ってフィルタが外れ、絞ったつもりの全件が返ってしまう（[09] 参照）。
+  query: z.string().min(1).optional().describe("title / memo の部分一致キーワード"),
   workspace: workspaceSchema.optional().describe(WS_DESC),
   status: statusSchema.optional().describe(STATUS_DESC),
-  project: z.string().optional().describe("プロジェクトラベルの完全一致"),
+  project: z.string().min(1).optional().describe("プロジェクトラベルの完全一致"),
   include_closed: z
     .boolean()
     .optional()
@@ -172,7 +184,7 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
     withUser(async (userId, args: GetAgendaArgs) => {
       const workspace = resolveWorkspace(args.workspace);
       log({ tool: "get_agenda", ws: workspace ?? null });
-      if (!workspace) return workspaceMissingError();
+      if (!workspace) return workspaceMissingError(deps.invalidWorkspaceQuery);
 
       const tasks = await listOpenTasks(deps.openDb(), { userId, workspace });
       return ok(
@@ -229,10 +241,10 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
         });
         log({ tool: "upsert_task", mode: "update", id: args.id, changed: result?.changed ?? null });
         if (!result) {
-          const openIds = await listOpenTaskIds(db, {
-            userId,
-            workspace: resolveWorkspace(args.workspace),
-          });
+          // workspace は「移動先として設定したい値」であってアンカーを絞る
+          // レンズではない。get_task / complete_task と同じく、id を打ち間違えた
+          // ときの「実在する id」一覧は全 workspace から出す（[09] 参照）。
+          const openIds = await listOpenTaskIds(db, { userId });
           return taskNotFoundError(args.id, openIds, true);
         }
         const changed = result.changed.length > 0 ? result.changed.join(", ") : "なし";
@@ -246,7 +258,7 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
       const workspace = resolveWorkspace(args.workspace);
       if (!workspace) {
         log({ tool: "upsert_task", mode: "create", error: "workspace_missing" });
-        return workspaceMissingError();
+        return workspaceMissingError(deps.invalidWorkspaceQuery);
       }
 
       const created = await createTask(db, {
@@ -301,7 +313,7 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
     withUser(async (userId, args: SearchTasksArgs) => {
       const workspace = resolveWorkspace(args.workspace);
       log({ tool: "search_tasks", ws: workspace ?? null, closed: args.include_closed ?? false });
-      if (!workspace) return workspaceMissingError();
+      if (!workspace) return workspaceMissingError(deps.invalidWorkspaceQuery);
 
       const { total, tasks } = await searchTasks(deps.openDb(), {
         userId,
@@ -312,7 +324,12 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
         includeClosed: args.include_closed,
         limit: SEARCH_LIMIT,
       });
-      return ok(buildSearchResult(workspace, total, tasks, args.include_closed ?? false));
+      return ok(
+        buildSearchResult(workspace, total, tasks, {
+          status: args.status,
+          includeClosed: args.include_closed ?? false,
+        }),
+      );
     }),
   );
 

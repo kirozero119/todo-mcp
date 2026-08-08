@@ -140,13 +140,44 @@ describe("status 遷移と closed_at", () => {
     });
   });
 
-  it("completeTask は冪等 —— 既 done なら closed_at を上書きしない", async () => {
+  it("completeTask は冪等 —— 既に done なら closed_at を上書きしない", async () => {
     const task = await seed();
     await completeTask(db, { userId: ME, id: task.id, now: T0 });
 
     const again = await completeTask(db, { userId: ME, id: task.id, now: T1 });
     expect(again?.alreadyDone).toBe(true);
     expect(again?.task.closed_at).toBe(T0);
+  });
+
+  it("同時に complete_task しても両方が『今回完了した』と応答せず、closed_at は最初の完了時刻のまま", async () => {
+    const task = await seed();
+    const T2 = "2026-08-03T00:00:00Z";
+
+    // このテストの TaskDb（node:sqlite 版）は db.all()/db.get() の中身が
+    // 同期実行のうえで Promise.resolve() に包まれているだけ。そのため
+    // Promise.all で並べた 2 本の completeTask は「両方の UPDATE 文が、
+    // どちらの結果も読まれるより先に評価順で逐次実行される」形になり、
+    // 2 台からの同時 complete_task で起きる read-then-write レースを
+    // ここで決定的に再現できる。
+    const [a, b] = await Promise.all([
+      completeTask(db, { userId: ME, id: task.id, now: T1 }),
+      completeTask(db, { userId: ME, id: task.id, now: T2 }),
+    ]);
+
+    const results = [a, b].filter((r): r is NonNullable<typeof r> => r !== null);
+    expect(results).toHaveLength(2);
+
+    const winners = results.filter((r) => !r.alreadyDone);
+    const losers = results.filter((r) => r.alreadyDone);
+    // ちょうど 1 本だけが「今回完了した」と応答する（両方が名乗ってはいけない）。
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    // 既 done 応答側の closed_at は、勝った側が書いた時刻のまま
+    // ——自分が渡した now では上書きされない。
+    expect(losers[0]?.task.closed_at).toBe(winners[0]?.task.closed_at);
+
+    const final = await getTask(db, { userId: ME, id: task.id });
+    expect(final?.closed_at).toBe(winners[0]?.task.closed_at);
   });
 
   it("open なタスクだけが listOpenTasks に出る（someday は open 扱い）", async () => {
@@ -243,6 +274,34 @@ describe("searchTasks", () => {
 
     const found = await searchTasks(db, { userId: ME, workspace: "life", query: "50%", limit: 20 });
     expect(found.tasks.map((task) => task.title)).toEqual(["進捗 50% のタスク"]);
+  });
+
+  it("query の _ は文字として扱う（LIKE の単一文字ワイルドカードにしない）", async () => {
+    await seed({ title: "under_score のタスク" });
+    // "_" が単一文字ワイルドカードのままだと、無関係な "underXscore" にも
+    // マッチしてしまう。
+    await seed({ title: "underXscore のタスク" });
+
+    const found = await searchTasks(db, {
+      userId: ME,
+      workspace: "life",
+      query: "under_score",
+      limit: 20,
+    });
+    expect(found.tasks.map((task) => task.title)).toEqual(["under_score のタスク"]);
+  });
+
+  it("query の \\ はエスケープ文字自体として扱う", async () => {
+    await seed({ title: "パス C:\\temp のタスク" });
+    await seed({ title: "関係ないタスク" });
+
+    const found = await searchTasks(db, {
+      userId: ME,
+      workspace: "life",
+      query: "C:\\temp",
+      limit: 20,
+    });
+    expect(found.tasks.map((task) => task.title)).toEqual(["パス C:\\temp のタスク"]);
   });
 
   it("limit で打ち切っても total は全件数を返す", async () => {

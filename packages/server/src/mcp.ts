@@ -31,6 +31,20 @@ export interface TodoServerDeps {
 }
 
 /**
+ * `resolveDefaultWorkspace()` の結果。
+ *
+ * 「`?workspace=` が付いていない」と「付いているが "work"/"life" のどちらでもない」
+ * を区別して保持する。後段のエラー文（workspaceMissingError）が、前者は
+ * 「未指定」、後者は実際に来た不正値をエコーする、という違う文言を組み立てる
+ * ために必要（[09] 参照）。
+ */
+export interface DefaultWorkspaceResolution {
+  workspace: Workspace | undefined;
+  /** クエリはあったが不正だった場合の生値。クエリ自体が無い場合は undefined。 */
+  invalidValue: string | undefined;
+}
+
+/**
  * マシンごとの既定 workspace は接続 URL の `?workspace=work|life`（チケット 04）。
  *
  * 会社 PC は `?workspace=work`、私物 Mac は `?workspace=life` で接続する。
@@ -38,10 +52,12 @@ export interface TodoServerDeps {
  * 使われた回数は 0 —— それでも残すのは、明示し忘れたときに life が会社 PC の
  * 画面に出ないための保険だから。
  */
-function resolveDefaultWorkspace(request: Request | undefined): Workspace | undefined {
-  if (!request) return undefined;
+function resolveDefaultWorkspace(request: Request | undefined): DefaultWorkspaceResolution {
+  if (!request) return { workspace: undefined, invalidValue: undefined };
   const value = new URL(request.url).searchParams.get("workspace");
-  return value === "work" || value === "life" ? value : undefined;
+  if (value === "work" || value === "life") return { workspace: value, invalidValue: undefined };
+  // value === null はクエリ自体が無い（正常な省略）。それ以外は不正な値。
+  return { workspace: undefined, invalidValue: value ?? undefined };
 }
 
 /**
@@ -108,9 +124,11 @@ export const createTodoMcpServer =
       },
     );
 
+    const workspaceResolution = resolveDefaultWorkspace(ctx.requestInfo);
     registerTodoTools(server, {
       openDb: deps.openDb,
-      defaultWorkspace: resolveDefaultWorkspace(ctx.requestInfo),
+      defaultWorkspace: workspaceResolution.workspace,
+      invalidWorkspaceQuery: workspaceResolution.invalidValue,
       requestId: resolveRequestId(ctx.requestInfo),
     });
 

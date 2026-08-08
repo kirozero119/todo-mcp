@@ -7,7 +7,7 @@
  * 前提でサーバー側は情報密度を優先する。CLI（チケット 11）は同じ Task から
  * まったく別の整形を持つので、共有すると両方が歪む。
  */
-import { weekdayIndex, type Task, type Workspace } from "@todo-mcp/core";
+import { weekdayIndex, type Status, type Task, type Workspace } from "@todo-mcp/core";
 
 const WEEKDAYS_JA = ["日", "月", "火", "水", "木", "金", "土"] as const;
 
@@ -137,7 +137,22 @@ export function openIdsAnchor(ids: readonly number[]): string {
   return ids.length > CAP ? `${shown} …他${ids.length - CAP}件` : shown;
 }
 
-export function workspaceMissingError(): ToolText {
+/**
+ * workspace が未解決（ツール引数省略 かつ 接続既定も未設定）のときのエラー。
+ *
+ * `invalidQueryValue` は接続 URL に `?workspace=` は付いていたが不正だった
+ * 場合の生値。指定があれば「未指定」ではなく実際に来た不正値をエコーする
+ * （3 部品の①）。マシン設定のタイプミス（例: `?workspace=lif`）を、
+ * 「そもそも指定していない」場合と区別して特定できるようにするため。
+ */
+export function workspaceMissingError(invalidQueryValue?: string): ToolText {
+  if (invalidQueryValue !== undefined) {
+    return errText([
+      `不正な値: workspace="${invalidQueryValue}"`,
+      '期待する値: "work" または "life"',
+      "接続 URL の ?workspace= の値が不正です。work または life に直すか、ツール引数 workspace を明示して呼び直してください。",
+    ]);
+  }
   return errText([
     "不正な値: workspace=(未指定)",
     '期待する値: "work" または "life"',
@@ -182,23 +197,45 @@ export function taskNotFoundError(
 
 export function titleRequiredError(): ToolText {
   return errText([
-    "不正な値: title=(未指定)",
+    "不正な値: title=(未指定または空)",
     "新規作成には title が必須です。",
     "既存タスクを更新したい場合は id を指定してください。",
   ]);
 }
 
-/** search_tasks の結果本文。CAP を超えた分は件数だけ示して絞り込みに誘導する。 */
+/** search_tasks が実際に検索した条件。0 件時のスコープ表示を実効条件に合わせるために使う。 */
+export interface SearchScope {
+  /** searchTasks() 内で status 指定は includeClosed より優先される（SQL 側の分岐と一致させる）。 */
+  status: Status | undefined;
+  includeClosed: boolean;
+}
+
+/**
+ * search_tasks の結果本文。CAP を超えた分は件数だけ示して絞り込みに誘導する。
+ *
+ * 0 件時のスコープ表示は `scope`（実際に SQL が使った検索条件）から組み立てる。
+ * `status` 指定時は SQL がそれを優先し `includeClosed` を無視するため、
+ * `include_closed: true` にしても範囲は広がらない —— その場合は誘導文を出さない。
+ * 同様に `includeClosed: true` は既に最大範囲なので、これ以上広げる案内は不要。
+ * 誘導文が意味を持つのは「status 未指定 かつ includeClosed が false」のときだけ。
+ */
 export function buildSearchResult(
   workspace: Workspace,
   total: number,
   tasks: readonly Task[],
-  includeClosed: boolean,
+  scope: SearchScope,
 ): string {
   if (total === 0) {
-    const scope = includeClosed ? "、closed 含む" : "、open のみ";
-    const hint = includeClosed ? "" : " done / cancelled も探すには include_closed: true。";
-    return `該当 0 件（workspace: ${workspace}${scope}）。${hint}`;
+    const scopeLabel = scope.status
+      ? `、status: "${scope.status}" のみ`
+      : scope.includeClosed
+        ? "、closed 含む"
+        : "、open のみ";
+    const hint =
+      !scope.status && !scope.includeClosed
+        ? " done / cancelled も探すには include_closed: true。"
+        : "";
+    return `該当 0 件（workspace: ${workspace}${scopeLabel}）。${hint}`;
   }
   const lines = [`該当 ${total} 件（workspace: ${workspace}）`, ...tasks.map(fmtLine)];
   if (total > tasks.length) {

@@ -1,3 +1,4 @@
+import type { TaskDb } from "@todo-mcp/core";
 import { createMcpHandler } from "agents/mcp/server";
 import { describe, expect, it } from "vitest";
 
@@ -40,8 +41,17 @@ function handlerWithProps(props: Record<string, unknown> | undefined) {
   });
 }
 
-function buildMcpRequest(method: string, params: Record<string, unknown>): Request {
-  return new Request("http://localhost:8788/mcp", {
+/**
+ * `url` defaults to the same bare `/mcp` used everywhere else in this file;
+ * tests that need a `?workspace=` query pass it explicitly (see the
+ * "get_agenda workspace resolution" describe block below).
+ */
+function buildMcpRequest(
+  method: string,
+  params: Record<string, unknown>,
+  url = "http://localhost:8788/mcp",
+): Request {
+  return new Request(url, {
     method: "POST",
     headers: {
       // workerd always supplies Host; Node's Request does not, and the
@@ -74,8 +84,9 @@ async function call(
   handler: ReturnType<typeof handlerWithProps>,
   method: string,
   params: Record<string, unknown>,
+  url?: string,
 ): Promise<Record<string, unknown>> {
-  const response = await handler.fetch(buildMcpRequest(method, params));
+  const response = await handler.fetch(buildMcpRequest(method, params, url));
   return parseMcpResult(response);
 }
 
@@ -167,5 +178,61 @@ describe("scope enforcement (mcpApiHandler)", () => {
 
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toEqual(PROPS);
+  });
+});
+
+/**
+ * [09] Builds a bare `TaskDb` fake (plain `all`/`get`, no `node:sqlite`) that
+ * records the `workspace` argument each `listOpenTasks()` call passed to
+ * `db.all()`. server's tsconfig carries no node types, so the in-memory
+ * `node:sqlite` harness used in packages/core/test can't run here — but
+ * get_agenda only needs to observe *which* workspace value reached the
+ * query, not exercise real SQL, so this fake is enough (see
+ * docs/design-notes.md's "TaskDb を最小インターフェースにして node:sqlite で
+ * テストする" for why the real DB harness is core-only).
+ */
+function fakeTaskDb(): { db: TaskDb; workspacesQueried: unknown[] } {
+  const workspacesQueried: unknown[] = [];
+  const db: TaskDb = {
+    // listOpenTasks() (packages/core/src/tasks.ts) binds args in the order
+    // [userId, workspace, ...OPEN_STATUSES], so the workspace is args[1].
+    all: async (_sql: string, args: unknown[] = []) => {
+      workspacesQueried.push(args[1]);
+      return [];
+    },
+    get: async () => undefined,
+  };
+  return { db, workspacesQueried };
+}
+
+describe("get_agenda workspace resolution ([09])", () => {
+  it("falls back to the ?workspace= URL default when the tool argument is omitted, and a tool argument overrides it", async () => {
+    const { db, workspacesQueried } = fakeTaskDb();
+    const handler = createMcpHandler(createTodoMcpServer({ openDb: () => db }), {
+      route: "/mcp",
+      authContext: { props: PROPS },
+    });
+
+    const defaulted = await call(
+      handler,
+      "tools/call",
+      { name: "get_agenda", arguments: {} },
+      "http://localhost:8788/mcp?workspace=work",
+    );
+    expect(defaulted.isError).toBeFalsy();
+
+    const overridden = await call(
+      handler,
+      "tools/call",
+      { name: "get_agenda", arguments: { workspace: "life" } },
+      "http://localhost:8788/mcp?workspace=work",
+    );
+    expect(overridden.isError).toBeFalsy();
+
+    // First call used the connection's ?workspace=work default; the second
+    // call's explicit tool argument ("life") won even though the URL default
+    // was still "work" — the tool argument always wins (todo-tools.ts's
+    // resolveWorkspace: `argument ?? deps.defaultWorkspace`).
+    expect(workspacesQueried).toEqual(["work", "life"]);
   });
 });
