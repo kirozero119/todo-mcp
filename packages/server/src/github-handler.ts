@@ -345,6 +345,11 @@ app.get("/callback", async (c) => {
       userId: githubGrantUserId(identity.id),
       metadata: { label: identity.login },
       scope: grantedScopes,
+      // [09/複数端末] CIMD では client_id が全端末で同一のため、既定の
+      // revokeExistingGrants（同一 userId+clientId の既存 grant を全 revoke）
+      // のままだと1台の再認可が他端末を丸ごとログアウトさせる。詳細は
+      // docs/design-notes.md 参照。
+      revokeExistingGrants: false,
       props: {
         login: identity.login,
         user_id: githubUserId(identity.id),

@@ -463,4 +463,41 @@ describe("GET /callback", () => {
     expect(call?.scope).toEqual(["todo"]);
     expect((call?.props as { scopes?: string[] } | undefined)?.scopes).toEqual(["todo"]);
   });
+
+  // [09/複数端末] CIMD の client_id は端末を問わず同一なので、provider の既定
+  // （同一 userId+clientId の既存 grant を再認可のたびに全 revoke）のままだと
+  // 1台の再認可が他端末の grant を丸ごと消してしまう。この呼び出しが
+  // revokeExistingGrants: false を伴うことを固定し、その回帰を防ぐ。
+  it("[09/複数端末] calls completeAuthorization with revokeExistingGrants: false", async () => {
+    stubGitHubFetch({ login: "octocat", id: 1 });
+
+    const kv = kvStub();
+    const { stateToken } = await createOAuthState(BASE_AUTH_REQUEST, kv);
+    await approveOAuthState(stateToken, kv);
+    const { setCookie } = await bindStateToSession(stateToken);
+    const sessionCookiePair = setCookie.split(";")[0]!;
+
+    const completeAuthorization = vi.fn(
+      async (_options: Parameters<OAuthHelpers["completeAuthorization"]>[0]) => ({
+        redirectTo: "https://client.example/callback?code=final-code",
+      }),
+    );
+    const env = makeEnv({
+      kv,
+      allowedUsers: "octocat",
+      provider: oauthProviderStub({ completeAuthorization }),
+    });
+
+    const request = new Request(
+      `http://localhost:8788/callback?code=upstream-code&state=${stateToken}`,
+      { headers: { Cookie: sessionCookiePair } },
+    );
+
+    const response = await GitHubHandler.fetch(request, env, ctxStub);
+
+    expect(response.status).toBe(302);
+    expect(completeAuthorization).toHaveBeenCalledTimes(1);
+    const call = completeAuthorization.mock.calls[0]?.[0];
+    expect(call?.revokeExistingGrants).toBe(false);
+  });
 });

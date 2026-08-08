@@ -38,6 +38,7 @@
   - [GitHub-side denial] GitHub 自身の拒否をアクセス拒否として扱う
   - [P1-2/L-7] audience 補完と resourceMatchOriginOnly の対応
   - [scope enforcement] grantedScopes を一度だけ計算し、grant と props の両方に使う
+  - [09/複数端末] completeAuthorization() に revokeExistingGrants: false を渡す
 - [index.ts](#indexts)
   - [M-4] DCR 登録の有効期限を 7日 から 90日（provider 既定値）に戻した経緯
   - allowPlainPKCE を false にする理由
@@ -341,6 +342,23 @@
 **対応**: `resolveGrantedScopes()` の結果を一度だけ計算し、`completeAuthorization()` の `scope` と `props.scopes` の両方にそのまま使い回す。
 
 **ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ（強制ロジック本体は `mcp.ts` の `hasRequiredScope()`）
+
+### [09/複数端末] completeAuthorization() に revokeExistingGrants: false を渡す
+
+**問題**: `@cloudflare/workers-oauth-provider@0.8.3` の `completeAuthorization()` は、`revokeExistingGrants` が明示的に `false` でない限り、同じ `(userId, clientId)` の既存 grant を全て revoke する（`dist/oauth-provider.js`: `revokeExistingGrants !== false` の分岐 → `grant.clientId === clientId` だけで収集 → `revokeGrant()`）。CIMD（Client ID Metadata Document）では `client_id` はクライアント側のビルド定数で、Claude Code は端末を問わず同じ `client_id`（`https://claude.ai/oauth/claude-code-client-metadata`）を名乗る。松本さんの3台のマシンが同じ GitHub アカウントで認可すると `userId` も `clientId` も揃うため、1台が再認可するたびに他2台の grant が丸ごと消え、access token は 401 `invalid_token`、refresh token は 400 `invalid_grant` になっていた。
+
+**対応**: `completeAuthorization()` の呼び出しに `revokeExistingGrants: false` を明示する。
+
+**なぜ既定値がここでは害になるか**: この既定（再認可時に同一 user+client の既存 grant を revoke する）は DCR（Dynamic Client Registration）を前提にした設計で、端末ごとに個別の `client_id` が発番されていた頃は「この端末の古いセッションだけを切る」ことを意味していた。CIMD では `client_id` がクライアント実装単位（＝ Claude Code というアプリそのもの）に固定されるため、同じコードが「自分の他の端末を全部ログアウトさせる」に化ける。
+
+**手放す性質とそれが軽い理由**: 再認可のたびに同一 user+client の古い grant を自動整理する挙動を手放す。ただし:
+- Props に GitHub の upstream アクセストークンを持たせていない（本ファイル冒頭 `types.ts` の「Props に GitHub の upstream アクセストークンを持たせない」参照）ため、この既定が本来防ぎたい「古い upstream トークンが残り続ける」問題自体が起きない。持っていないトークンは漏洩しようがない
+- 個別の grant を明示的に無効化したい場合は RFC 7009 の個別 revoke（`revokeGrant()`）が引き続き使える
+- 使われない grant も無期限には残らない。`index.ts` で `refreshTokenTTL` を上書きしていないため provider 既定の 720 時間（30日）で自然失効する
+
+**上流のその後**: `@cloudflare/workers-oauth-provider` v0.10.2 でもこの挙動・既定値は同じままで、ticket 13（v0.10.2 追従）でライブラリを上げても本項の対応は不要にならない。`revokeExistingGrants` は 0.3.0 の PR #144 で「同一 user+client の再認可ループ対策」として意図的に導入されたオプションで、CHANGELOG 自身が「複数端末で同時に concurrent grant を持たせたい場合は `revokeExistingGrants: false` を設定せよ」と明示している。つまりこれは修正待ちのバグではなく、ライブラリ側が用意した opt-out を呼び出し側が明示していなかっただけであり、バージョンを上げれば消える性質のものではない。
+
+**ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ、`completeAuthorization()` 呼び出し
 
 ---
 
