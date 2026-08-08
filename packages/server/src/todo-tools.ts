@@ -42,6 +42,7 @@ import {
   taskNotFoundError,
   titleRequiredError,
   workspaceMissingError,
+  workspaceMissingText,
   type ToolText,
 } from "./todo-format";
 import type { Props } from "./types";
@@ -352,8 +353,10 @@ export function registerTodoTools(server: McpServer, deps: TodoToolDeps): void {
       if (!userId) {
         text = "この接続に認証済みアイデンティティがありません。";
       } else if (!deps.defaultWorkspace) {
-        text =
-          "既定 workspace が未設定のため表示できません（接続 URL に ?workspace=work|life を付けてください）。";
+        // ツール 3 経路（get_agenda / upsert_task / search_tasks）と同じ
+        // workspaceMissingError の文言を使う。経路によって文言が違う理由が
+        // ないので、未指定・不正値の出し分けもツール側と揃える（[09/レビュー]）。
+        text = workspaceMissingText(deps.invalidWorkspaceQuery);
       } else {
         const tasks = await listOpenTasks(deps.openDb(), {
           userId,

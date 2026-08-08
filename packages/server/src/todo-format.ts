@@ -138,26 +138,46 @@ export function openIdsAnchor(ids: readonly number[]): string {
 }
 
 /**
- * workspace が未解決（ツール引数省略 かつ 接続既定も未設定）のときのエラー。
+ * workspace が未解決（ツール引数省略 かつ 接続既定も未設定）のときの本文。
  *
  * `invalidQueryValue` は接続 URL に `?workspace=` は付いていたが不正だった
  * 場合の生値。指定があれば「未指定」ではなく実際に来た不正値をエコーする
  * （3 部品の①）。マシン設定のタイプミス（例: `?workspace=lif`）を、
  * 「そもそも指定していない」場合と区別して特定できるようにするため。
+ *
+ * ツール（ToolText を返す `workspaceMissingError`）とリソース（プレーン
+ * テキストを返す `workspaceMissingText`）の両方がこの行配列を共有する。
+ * どちらの経路で workspace が未解決になっても同じ文言を返す —— 経路ごとに
+ * 別の文言を持つと、片方だけ直して片方を直し忘れる非対称が起きるため。
  */
-export function workspaceMissingError(invalidQueryValue?: string): ToolText {
+function workspaceMissingLines(invalidQueryValue?: string): string[] {
   if (invalidQueryValue !== undefined) {
-    return errText([
+    return [
       `不正な値: workspace="${invalidQueryValue}"`,
       '期待する値: "work" または "life"',
       "接続 URL の ?workspace= の値が不正です。work または life に直すか、ツール引数 workspace を明示して呼び直してください。",
-    ]);
+    ];
   }
-  return errText([
+  return [
     "不正な値: workspace=(未指定)",
     '期待する値: "work" または "life"',
     "この接続には既定 workspace が設定されていません（接続 URL に ?workspace=work|life を付けると設定されます）。ツール引数 workspace を明示して呼び直してください。",
-  ]);
+  ];
+}
+
+export function workspaceMissingError(invalidQueryValue?: string): ToolText {
+  return errText(workspaceMissingLines(invalidQueryValue));
+}
+
+/**
+ * `workspaceMissingError` と同じ文言をプレーンテキストで返す。
+ *
+ * today-agenda リソース（`ToolText` ではなく `ReadResourceResult` の
+ * `contents[].text` を返す）が、get_agenda / upsert_task / search_tasks の
+ * 3 ツールと同じエラー文言をハードコードなしで再利用するために使う。
+ */
+export function workspaceMissingText(invalidQueryValue?: string): string {
+  return workspaceMissingLines(invalidQueryValue).join("\n");
 }
 
 /**

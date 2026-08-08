@@ -433,7 +433,9 @@
 
 **対応**: `resolveDefaultWorkspace()` の戻り値を `Workspace | undefined` から `{ workspace, invalidValue }` に変え、「クエリ自体が無い」（`invalidValue: undefined`）と「クエリはあるが不正」（`invalidValue: <生の値>`）を区別して保持する。`TodoToolDeps.invalidWorkspaceQuery` として `todo-tools.ts` まで運び、`workspaceMissingError()` がこれを受け取って、値があれば `不正な値: workspace="lif"` のように実際に来た値をエコーし、無ければ従来通り「未指定」の文言を出す。期待する形式（"work" または "life"）と回復手順（URL の `?workspace=` を直す / ツール引数で明示する）は 3 部品構成のまま維持し、①だけを実効化した。有効な値（"work"/"life"）が来た場合の挙動は変えていない。
 
-**ソース位置**: `packages/server/src/mcp.ts` の `resolveDefaultWorkspace()`。エラー文の組み立ては `packages/server/src/todo-format.ts` の `workspaceMissingError()`、運搬経路は `packages/server/src/todo-tools.ts` の `TodoToolDeps.invalidWorkspaceQuery`
+**波及（レビュー時の見落とし訂正）**: 当初この修正はツール 3 経路（get_agenda / upsert_task / search_tasks）にしか適用していなかったが、`today-agenda` MCP リソースハンドラ（get_agenda ツールとは別物）も同じ「既定 workspace が未解決」の分岐を持ち、こちらは修正前の `workspaceMissingError` 導入以前からある独自のハードコード文言（「既定 workspace が未設定のため表示できません」）をそのまま持っていた。ツール側だけ不正値をエコーしリソース側だけ「未設定」の一点張りになる非対称に理由がないため、`workspaceMissingError` と行配列を共有する `workspaceMissingText()`（プレーンテキスト版）を切り出し、リソースハンドラもこれを通す形に揃えた。ハードコード文言は削除し、`deps.invalidWorkspaceQuery` はツールと同じ経路（`TodoToolDeps`）でリソースハンドラにも届く。
+
+**ソース位置**: `packages/server/src/mcp.ts` の `resolveDefaultWorkspace()`。エラー文の組み立ては `packages/server/src/todo-format.ts` の `workspaceMissingError()` / `workspaceMissingText()`、運搬経路は `packages/server/src/todo-tools.ts` の `TodoToolDeps.invalidWorkspaceQuery`（呼び出し元は 3 ツールハンドラと `today-agenda` リソースハンドラ）
 
 ---
 

@@ -236,3 +236,45 @@ describe("get_agenda workspace resolution ([09])", () => {
     expect(workspacesQueried).toEqual(["work", "life"]);
   });
 });
+
+// [09/レビュー] The today-agenda *resource* handler (distinct from the
+// get_agenda *tool*) used to carry its own hardcoded "既定 workspace が
+// 未設定" string and never received an invalid `?workspace=` value at all —
+// the same defect fix 4 addressed for the three tool paths, left unfixed on
+// the resource path. These tests pin the resource to the same
+// workspaceMissingError wording (via workspaceMissingText) so that
+// asymmetry can't silently come back. Neither case ever reaches the DB
+// (workspace resolution fails before `deps.openDb()` is called), so TEST_DEPS'
+// throwing openDb is safe to use here too.
+describe("today-agenda resource workspace resolution ([09/レビュー])", () => {
+  it("uses the same wording as workspaceMissingError when ?workspace= is absent from the connection URL", async () => {
+    const handler = createMcpHandler(createTodoMcpServer(TEST_DEPS), {
+      route: "/mcp",
+      authContext: { props: PROPS },
+    });
+
+    const result = await call(handler, "resources/read", { uri: "todo://today" });
+
+    const contents = result.contents as Array<{ uri: string; text: string }>;
+    expect(contents[0]?.text).toContain("不正な値: workspace=(未指定)");
+    // Pins that the old hardcoded resource-only string is gone for good.
+    expect(contents[0]?.text).not.toContain("既定 workspace が未設定のため表示できません");
+  });
+
+  it("echoes an invalid ?workspace= query value instead of the generic missing message", async () => {
+    const handler = createMcpHandler(createTodoMcpServer(TEST_DEPS), {
+      route: "/mcp",
+      authContext: { props: PROPS },
+    });
+
+    const result = await call(
+      handler,
+      "resources/read",
+      { uri: "todo://today" },
+      "http://localhost:8788/mcp?workspace=lif",
+    );
+
+    const contents = result.contents as Array<{ uri: string; text: string }>;
+    expect(contents[0]?.text).toContain('不正な値: workspace="lif"');
+  });
+});
