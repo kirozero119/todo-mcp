@@ -15,6 +15,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createTaskDb, type TaskDb, type Workspace } from "@todo-mcp/core";
 import { z } from "zod";
 
+import { githubNumericIdFromUserId, isGitHubUserAllowed } from "./allowlist";
 import { MCP_ROUTE, SCOPES_SUPPORTED, SERVER_NAME, SERVER_VERSION } from "./config";
 import { registerTodoTools } from "./todo-tools";
 import { tursoConfigFromEnv } from "./turso";
@@ -163,6 +164,50 @@ function insufficientScopeResponse(): Response {
 }
 
 /**
+ * [15/allowlist per request] このトークンが名乗るアイデンティティが、*今の*
+ * `ALLOWED_GITHUB_USERS` にまだ載っているか。
+ *
+ * `/callback` の入口判定（github-handler.ts）と**同じ** `isGitHubUserAllowed()`
+ * を通す。判定関数を分けると、入口と毎リクエストで許可集合がずれ得る。
+ * allowlist が未設定・空のときに全員拒否になるフェイルクローズも、その関数の
+ * 既存の扱いをそのまま引き継ぐ。詳細は docs/design-notes.md 参照。
+ */
+function isIdentityAllowed(props: Partial<Props> | undefined, env: Partial<Env>): boolean {
+  return isGitHubUserAllowed(
+    props?.login,
+    githubNumericIdFromUserId(props?.user_id),
+    env.ALLOWED_GITHUB_USERS,
+  );
+}
+
+/**
+ * [15/allowlist per request] 拒否は 403 ではなく 401 `invalid_token`。
+ *
+ * ヘッダーは provider 自身の 401（`buildWwwAuthenticateHeader` /
+ * `handleApiRequest`）と同じ形にする —— `resource_metadata` があることで、
+ * MCP クライアントはこの 401 を「再認証せよ」と読める。再認証は `GET /callback`
+ * の allowlist に当たって `access_denied` になるので、「もう許可されていない」が
+ * ブラウザ上で人間に見える。`scope=` を足すのは index.ts の `onError()`
+ * ([M-2/P1-3]) と同じ理由・同じ形にするため。詳細は docs/design-notes.md 参照。
+ */
+function identityNotAllowedResponse(request: Request): Response {
+  const url = new URL(request.url);
+  const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
+  // `"` を含めない（WWW-Authenticate の quoted-string を壊さないため）。
+  const description = "This GitHub identity is no longer allowed to use this server";
+  return new Response(JSON.stringify({ error: "invalid_token", error_description: description }), {
+    status: 401,
+    headers: {
+      "Content-Type": "application/json",
+      "WWW-Authenticate":
+        `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", ` +
+        `error="invalid_token", error_description="${description}", ` +
+        `scope="${SCOPES_SUPPORTED.join(" ")}"`,
+    },
+  });
+}
+
+/**
  * Turso 接続を開くクロージャ。設定が無ければ投げる。
  *
  * リクエスト全体を 500 で落とさないのは、`whoami` と `tools/list` を生かして
@@ -192,16 +237,33 @@ function tursoOpener(env: Partial<Env>): () => TaskDb {
  * ハンドラをここで組み立てているのは、env を受け取れるのがこの位置だけだから
  * （createTodoMcpServer の doc コメント参照）。組み立てるのは薄いラッパーで、
  * McpServer 自体は元々リクエストごとに作られる（stateless 設計）。
+ *
+ * [15/allowlist per request] allowlist の照合もここで行う。tools / resources /
+ * prompts / initialize はすべて同じ `/mcp` の POST なので、この 1 箇所が
+ * 全経路のゲートになる。
  */
 export const mcpApiHandler = {
   fetch: (request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> => {
     const props = (ctx as ExecutionContext & { props?: Partial<Props> }).props;
+    const workerEnv = (env ?? {}) as Partial<Env>;
+
+    // [15/allowlist per request] scope より先に見る。もうこのサーバーを使えない
+    // 身元に scope の不足を案内しても、実行できる回復手順にならないため。
+    if (!isIdentityAllowed(props, workerEnv)) {
+      console.log(
+        `[mcp] ${JSON.stringify({
+          event: "identity_not_allowed",
+          login: props?.login ?? null,
+          user_id: props?.user_id ?? null,
+        })}`,
+      );
+      return Promise.resolve(identityNotAllowedResponse(request));
+    }
     if (!hasRequiredScope(props)) return Promise.resolve(insufficientScopeResponse());
 
-    const handler = createMcpHandler(
-      createTodoMcpServer({ openDb: tursoOpener((env ?? {}) as Partial<Env>) }),
-      { route: MCP_ROUTE },
-    );
+    const handler = createMcpHandler(createTodoMcpServer({ openDb: tursoOpener(workerEnv) }), {
+      route: MCP_ROUTE,
+    });
     return handler(request, env, ctx);
   },
 };

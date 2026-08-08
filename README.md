@@ -155,6 +155,12 @@ MCPクライアント --(OAuth 2.1, PKCE S256, CIMD または DCR)--> このWork
   キャンセルした場合）も同じ経路で伝える。
 - トークンの props には `login` と `user_id`（`github:<numeric id>`）を含める。数値 id を使うのは、
   GitHub のログイン名は改名され、別人に再登録され得るため。
+- `ALLOWED_GITHUB_USERS` は入口だけの鍵ではない。`/mcp` はリクエストのたびに同じ許可リストを読み直し、
+  トークンの props（`login` / `user_id`）を照合する。許可リストから外されたユーザーは、発行済みの
+  トークンを持っていても次のリクエストから 401 `invalid_token` になる。クライアントはこの 401 で
+  再認証を試み、その再認証が `/callback` の同じ判定で `access_denied` になるので、「もう許可されて
+  いない」が人間の目に見える形で出る。止めるのに KV を手で触る必要はなく、許可リストに書き戻せば
+  そのまま元に戻る（トークンを revoke しないため、端末の再認可も要らない）。
 
 エンドポイント: `/authorize`、`/token`、`/register`（DCR）、`/callback`、
 `/.well-known/oauth-authorization-server`、`/.well-known/oauth-protected-resource[/mcp]`、
@@ -190,7 +196,8 @@ TURSO_AUTH_TOKEN=<turso db tokens create todo-mcp-dev の出力>
 Turso の 2 つが未設定でも起動はするが、DB に触るツールだけが「サーバー設定エラー」を返す
 （`whoami` と `tools/list` は生きたままにしてある——設定ミスの診断に使うため）。
 
-`ALLOWED_GITHUB_USERS` はフェイルクローズ設計——未設定または空なら全員拒否になる。値は GitHub の
+`ALLOWED_GITHUB_USERS` はフェイルクローズ設計——未設定または空なら全員拒否になる（新規の認可だけで
+なく `/mcp` の各リクエストにも効くので、空にすると発行済みトークンも通らなくなる）。値は GitHub の
 ログイン名（`octocat`）、またはログイン改名後に別人が空いた名前を再登録しても追跡できるよう、
 不変の数値 id を使った `github:<numeric id>` 形式（例: `github:583231`。
 `https://api.github.com/users/<login>` で確認可能）のどちらでもよい。
@@ -286,8 +293,10 @@ Chrome と Firefox での動作を確認済み。Safari は未検証。
   値に合わせている）。30 日の refresh token TTL より十分長く保ち、まだ有効な refresh token が自身の
   `client:<id>` の KV レコードより長生きすることがないようにしている。
 - アクセストークンの寿命は 1 時間、refresh token は 30 日（provider のデフォルト）。ユーザーの
-  アクセスを取り消すには `ALLOWED_GITHUB_USERS` から削除し、**かつ**そのユーザーのグラントを
-  削除すること——許可リストのチェックは認可時にのみ行われ、リクエストのたびには行われない。
+  アクセスを取り消すには `ALLOWED_GITHUB_USERS` から削除すれば足りる——許可リストは認可時だけで
+  なく `/mcp` のリクエストごとにも照合されるので、発行済みトークンも次のリクエストで 401 になる。
+  KV に残るグラントは拒否され続けたまま最長 30 日で自然失効する。特定の**端末**だけを切りたい場合
+  （ユーザー本人は使い続ける場合）は許可リストでは選べないため、KV のキー削除が引き続き必要。
 - provider は認可レスポンスに `iss` パラメータを送出しない。MCP final（SEP-2468）ではこれを AS
   にとっての SHOULD としており MUST ではない——既知のギャップであり不具合ではなく、これまで
   検証したどのクライアントに対しても現時点でブロッカーにはなっていない。

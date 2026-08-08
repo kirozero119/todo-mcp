@@ -12,6 +12,7 @@
 - [allowlist.ts](#allowlistts)
   - [M-3/P2-1] ALLOWED_GITHUB_USERS の二形式とフェイルクローズ
   - userId のコロン制約（githubGrantUserId）
+  - [15] props の `user_id` から数値 ID を復元する経路は正規形だけを受ける
 - [config.ts](#configts)
   - offline_access を scopes_supported に含めない理由
 - [redirect-uri.ts](#redirect-urits)
@@ -56,6 +57,7 @@
   - [09] Turso 未設定のとき 500 ではなく openDb で投げる理由
   - [09/レビュー] types.ts / turso.ts のコメントを実装に合わせて訂正した
   - [09/レビュー] 不正な `?workspace=` クエリ値をエラー文にエコーする
+  - [15] allowlist を `/mcp` のリクエストごとに再評価する
 - [packages/core](#packagescore)
   - [09] core / server の境界をどこで切ったか
   - [09] user_id スコープを「grep で確認できる」形に保つ
@@ -122,7 +124,7 @@
 
 **なぜこの形**: 未設定・空文字・空白のみの `ALLOWED_GITHUB_USERS` は「誰も許可しない」と判定する（フェイルクローズ）。設定ミスがあった場合、全世界に公開されるのではなく運用者自身がロックアウトされる方向に倒す。
 
-**ソース位置**: `allowlist.ts` の `isGitHubUserAllowed()`
+**ソース位置**: `allowlist.ts` の `isGitHubUserAllowed()`（呼び出し元は2箇所 —— `github-handler.ts` の `GET /callback`（入口）と、`mcp.ts` の `isIdentityAllowed()`（`/mcp` のリクエストごと。チケット 15 で追加））
 
 ### userId のコロン制約（githubGrantUserId）
 
@@ -133,6 +135,20 @@
 **なぜこの形**: grant 識別子とアプリ内の正規ユーザー ID を別の関数（`githubGrantUserId()` / `githubUserId()`）に分けることで、provider 側の制約とアプリの識別子表現を両立させている。
 
 **ソース位置**: `allowlist.ts` の `githubGrantUserId()` / `githubUserId()`
+
+### [15] props の `user_id` から数値 ID を復元する経路は正規形だけを受ける
+
+**問題**: `/mcp` のリクエストごとの allowlist 照合（[15] の項、mcp.ts）が `isGitHubUserAllowed()` に渡せる数値 ID は、`props.user_id`（`github:<数値ID>`）から復元するしかない。`/callback` は GitHub API のレスポンスから `id` を直接持っているが、`/mcp` にはこの文字列しか無い。ここが緩いと、`github:<数値ID>` 記法の allowlist エントリに、本来一致してはいけない値が一致し得る。
+
+**対応**: `githubNumericIdFromUserId()` は `githubUserId()` の出力そのものだけを受ける —— `/^github:(\d+)$/` に一致し、safe integer かつ正で、さらに**正規形との往復が一致**する場合のみ数値を返し、それ以外は `undefined`。落ちるもの: 別 IdP の名前空間（`google:583231`）、接頭辞なし（`583231`）、末尾のゴミ（`github:583231extra`）、非正規な桁表記（`github:0583231`）、前後の空白、2^53 超え。
+
+**なぜ往復まで見るか**: `Number("0583231")` も `parseInt("583231extra", 10)` も 583231 を返す。`isGitHubUserAllowed()` は数値に落としてから `String(numericId) === エントリの数字` で比べる作りなので、素朴なパースだとこの2種類が通ってしまう。最後に正規形と突き合わせれば両方まとめて落ちる（この2つはそれぞれ実際に変異テストで確認した。`docs` ではなくテスト側の `githubNumericIdFromUserId` ブロックが固定している）。
+
+**`undefined` を返したとき何が起きるか**: `isGitHubUserAllowed()` は `numericId != null` を要求するので、`github:<数値ID>` エントリには一致しなくなる。一方 `login` は別引数なので、ログイン名エントリでの一致は妨げない。つまりフェイルクローズ側に倒れるだけで、正規の利用者を締め出さない。
+
+**現実には起きない形まで落としている理由**: `props.user_id` を書き込むのは `/callback` の `githubUserId()` だけで、そこは正の整数をアサートしている。それでも厳しくするのは、`github:` プレフィックスが「他の IdP と衝突しないための予約」だと `githubUserId()` 自身が宣言しているから —— 将来 `google:` が入ったときに、この関数が黙って同じ数字を通すようでは予約の意味が無い。
+
+**ソース位置**: `allowlist.ts` の `githubNumericIdFromUserId()`（呼び出し元は `mcp.ts` の `isIdentityAllowed()`）
 
 ---
 
@@ -373,7 +389,9 @@
 
 **RFC 7009 の個別 revoke は「失くした端末の refresh token」を要求する**。provider の revocation endpoint は token endpoint と同じ `/token`（`revocation_endpoint: tokenEndpoint`、`!body.grant_type && !!body.token` で分岐）で確かに動くが、`revokeToken()` は `body.token` から `userId:grantId:secret` を取り出し、`revokeRefreshIfOwned()` が `grantData.refreshTokenId === tokenId`（または `previousRefreshTokenId`）で照合する。つまり**対象マシンの refresh token を手元に持っていないと、その grant は revoke できない**。端末を紛失したというまさに revoke が要る場面では、その token は失った端末の中にある。「代わりに RFC 7009 がある」は、失われた当のものを要求している。
 
-**`ALLOWED_GITHUB_USERS` からユーザーを外しても、生きている grant は切れない**。`isGitHubUserAllowed()` の呼び出しは `github-handler.ts` の `GET /callback` の1箇所だけで、`/mcp` へのリクエストごとの再チェックは無い。allowlist は「新しく grant を作らせない」ゲートであって、既存トークンの無効化ではない。これは今回の変更が作った性質ではなく元からそうだが、「代わりの手段」を考えるときの前提になるのでここに残す。
+**`ALLOWED_GITHUB_USERS` からユーザーを外しても、失くした端末だけを切ることはできない**。チケット 15 以降、allowlist から外れたユーザーは `/mcp` のリクエストごとに 401 で拒否されるので、「そのユーザーを丸ごと止める」ことは allowlist だけでできる（KV を触る必要は無い）。ただし単位が**ユーザー**なので自分の他の端末も同時に止まり、しかも拒否は読み取りだけで grant を revoke しない判断をしている（mcp.ts の「[15] allowlist を `/mcp` のリクエストごとに再評価する」参照）ため、allowlist に書き戻すと**失くした端末の grant も一緒に生き返る**。端末単位で切る手段は、以下の KV 削除のままである。
+
+> この段落は以前「外しても生きている grant は切れない」と書いていた。`isGitHubUserAllowed()` の呼び出しが `GET /callback` の1箇所しか無かった当時は正しかったが、チケット 15 で `mcpApiHandler` が同じ照合をリクエストごとに行うようになったため無効になった記述。
 
 **実際の手順**（`packages/server` で実行。namespace は `wrangler.jsonc` の `OAUTH_KV` バインディング）:
 
@@ -399,7 +417,7 @@ npx wrangler kv key delete "grant:<userId>:<grantId>" --binding OAUTH_KV --remot
 
 **何もしなくても最長30日で失効する**（次項）。緊急でなければ待つのも選択肢。
 
-**ソース位置**: 記録のみ（コード変更なし）。根拠は `dist/oauth-provider.js` の `revokeToken` / `revokeRefreshIfOwned`、`github-handler.ts` の `isGitHubUserAllowed()` 呼び出し1箇所
+**ソース位置**: 記録のみ（コード変更なし）。根拠は `dist/oauth-provider.js` の `revokeToken` / `revokeRefreshIfOwned`、および `isGitHubUserAllowed()` の呼び出し2箇所（`github-handler.ts` の `GET /callback` と `mcp.ts` の `isIdentityAllowed()`）
 
 ### [09/複数端末] grant の30日は認可時点からの絶対値で、refresh では延びない
 
@@ -543,6 +561,51 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 **波及（レビュー時の見落とし訂正）**: 当初この修正はツール 3 経路（get_agenda / upsert_task / search_tasks）にしか適用していなかったが、`today-agenda` MCP リソースハンドラ（get_agenda ツールとは別物）も同じ「既定 workspace が未解決」の分岐を持ち、こちらは修正前の `workspaceMissingError` 導入以前からある独自のハードコード文言（「既定 workspace が未設定のため表示できません」）をそのまま持っていた。ツール側だけ不正値をエコーしリソース側だけ「未設定」の一点張りになる非対称に理由がないため、`workspaceMissingError` と行配列を共有する `workspaceMissingText()`（プレーンテキスト版）を切り出し、リソースハンドラもこれを通す形に揃えた。ハードコード文言は削除し、`deps.invalidWorkspaceQuery` はツールと同じ経路（`TodoToolDeps`）でリソースハンドラにも届く。
 
 **ソース位置**: `packages/server/src/mcp.ts` の `resolveDefaultWorkspace()`。エラー文の組み立ては `packages/server/src/todo-format.ts` の `workspaceMissingError()` / `workspaceMissingText()`、運搬経路は `packages/server/src/todo-tools.ts` の `TodoToolDeps.invalidWorkspaceQuery`（呼び出し元は 3 ツールハンドラと `today-agenda` リソースハンドラ）
+
+### [15] allowlist を `/mcp` のリクエストごとに再評価する
+
+**問題**: `isGitHubUserAllowed()` の呼び出しは `github-handler.ts` の `GET /callback` の **1 箇所しか無かった**。認可の瞬間にしか照合していないので、`ALLOWED_GITHUB_USERS` から外したユーザーは発行済みトークンでそのままアクセスし続けられる —— access token は最長1時間、refresh を回せば grant の30日いっぱい使える。**allowlist が「入口の鍵」であって「継続的な権限」ではない**状態だった。松本さん個人の運用では実害がほぼ無い（載っているのは本人1人で外す場面が無い）が、セルフホスト前提の OSS として公開すると、設定項目の意味と実際の効果が食い違っていることになる。
+
+**対応**: `mcpApiHandler`（＝ OAuthProvider の `apiHandler`。scope 強制と同じ場所）で、`ctx.props` の身元を `env.ALLOWED_GITHUB_USERS` と毎リクエスト突き合わせる。`/mcp` は tools / resources / prompts / initialize がすべて同じ POST なので、この1箇所が全経路のゲートになる —— Resource `todo://today`、Prompt `todo-review`、`whoami` も自動的にカバーされる（テストで9経路を列挙して固定した）。**`/callback` 側の判定は外さない**。多層防御であって置き換えではなく、「外れたユーザーに新しい grant を作らせない」という入口の意味はそのまま要る。
+
+**判断1: 拒否は 401 `invalid_token`（403 ではない）**
+
+軸 —— ①MCP / OAuth の慣行 ②クライアント（Claude Code）が受け取った後に何をするか ③人間に状況が伝わるか。
+
+- ① RFC 6750 が定義するのは3つだけ（`invalid_request` 400 / `invalid_token` 401 / `insufficient_scope` 403）。今回の拒否は「このトークンの権限の粒度が足りない」ではなく「このトークンの主体がもうこのサーバーを使えない」なので、`insufficient_scope`（"requires higher privileges than provided by the access token"）に当てはまらない。403 で返すと「もっと広い権限を取り直せば通る」という含意が嘘になる。`invalid_token`（"revoked, or invalid for other reasons"）が意味的に近い。
+- ② MCP の Authorization 仕様は、401 を受けたクライアントは `WWW-Authenticate` の `resource_metadata`（RFC 9728）から認可サーバーを見つけて認可フローを開始する、としている。Claude Code の初回接続はまさにこの経路（トークン無し → provider の 401 → ブラウザが開く）で成立している。403 に対する既定の振る舞いは仕様に無く、単なる失敗として出る。
+- ③ 401 なら再認証がブラウザで走り、`GET /callback` の allowlist に当たって `access_denied` で返る。「もう許可されていない」が人間の目に見える形で出る。403 だと CLI 上の不透明なエラーで終わり、外された本人にも運用者にも理由が伝わらない。
+
+3軸とも 401 側なので 401 にした。ヘッダーは provider 自身の 401（`buildWwwAuthenticateHeader` / `handleApiRequest`）と同じ形に揃え、`resource_metadata` を必ず載せる。末尾に `scope="todo"` を足すのは index.ts の `onError()`（[M-2/P1-3]）と同じ理由・同じ形にするため。
+
+**この選択で受け入れたもの**: 外された人の端末は「ブラウザが開く → 拒否される」を繰り返す可能性がある。これは避けたいコストではなく③で欲しかったものそのもの（黙って失敗し続けるより、拒否が見えるほうがよい）。
+
+**未検証**: Claude Code が実際にこの 401 でブラウザを開くところは、デプロイしないと観測できない（チケット 15 の作業はデプロイ禁止）。根拠は仕様と、同じ形の 401 で初回認証が現に成立している実績まで。
+
+**判断2: 拒否時に grant / token を revoke しない**
+
+軸 —— ①拒否そのものの強度に効くか ②誤りからの回復可能性 ③読み取り経路に書き込みを増やすコスト ④運用の手間（KV の手動削除が要るか）。
+
+- ① 効かない。毎リクエストで拒否する以上、生きているトークンで通せるリクエストはもう無い。revoke が足すのは「このチェック自体が将来壊れたとき」の保険だが、チェックが動いているときにしか発火しない機構なので、まさにその場面では役に立たない。
+- ② ここが決め手。revoke は不可逆。allowlist の設定ミス（タイプミス、secret の消失、一時的に外して戻す運用）で誤って発火すると、全端末の grant が消え、**全端末が再認可**しないと戻らない。revoke しなければ、`ALLOWED_GITHUB_USERS` を直した瞬間に何事もなく元に戻る。フェイルクローズ（未設定＝全員拒否）と組み合わせると差は大きい —— secret を入れ忘れたデプロイが「全 grant の破壊」を意味するかどうかが変わる。
+- ③ revoke しなければ、拒否は「判断して返すだけ」の経路のままにできる。revoke するなら `OAuthHelpers.revokeGrant(grantId, userId)` が要るが、`handleApiRequest` が `ctx` に載せるのは `props` だけで grantId は無い（`dist/oauth-provider.js` で確認）。取るには Authorization ヘッダを自前で `userId:grantId:secret` に割って provider のトークン形式に依存するか、`unwrapToken()` で KV 読み+復号をもう一往復するかになる。どちらも、provider が既に検証した資格情報をこちらで再解釈する形になる。
+- ④ 手動削除の必要性はこの変更自体で消えている。外した人を止めるのに KV を触る必要はもう無い（下の kill switch 項を訂正した）。KV に残る grant は最長30日で自動失効し、その間ずっと 401 で拒否され続ける。
+
+②が決定的で、①が「得るものがほぼ無い」ことを示したので revoke しない。`revokeGrant` が呼ばれないことをテストで固定した。
+
+**判断3: 照合キーは `props.login` と、`props.user_id` から復元した数値 ID の両方**
+
+軸 —— ①入口 `/callback` と同じ許可集合になるか ②`props` からの復元経路が誤って広がらないか ③運用者が書いた記法（ログイン名 / `github:<数値ID>`）のどちらでも効くか。
+
+`/callback` と**同じ** `isGitHubUserAllowed(login, id, raw)` に通す（①③）。判定関数を分けると入口と毎リクエストで許可集合がずれ得るし、フェイルクローズの扱いも二重管理になる。②のために、`props.user_id` からの復元は正規形だけを受ける `githubNumericIdFromUserId()` を新設した（allowlist.ts の [15] の項）。
+
+**未設定・空のときの挙動**: `isGitHubUserAllowed()` の既存の扱い（フェイルクローズ）をそのまま引き継ぐ。「未設定なら発行済みトークンだけは通す」という例外は作らない —— 作ると、secret を失ったデプロイが「新規は誰も入れないが既存トークンは全部通る」という、どちらの意図とも違う状態になる。**帰結として、`ALLOWED_GITHUB_USERS` を空にした瞬間に既存トークンも全部止まる**。これは本チケットの不変条件（外した人は通らない）が「全員を外す」場合にも及ぶというだけで、意図した挙動。テストで固定してある。
+
+**`whoami` も対象にした**: 診断ツールだが素通しにしない。Turso 未設定のときに `whoami` を生かしているのは「サーバーの設定ミスを運用者が診断する」ためで、今回は設定通りに動いている状態にあたる。困っているのは運用者ではなく外された本人であり、その人に返すべき答えは身元の確認結果ではなく「もう許可されていない」（＝ 401 とその後の再認証拒否）。ゲートを1つでも開けると「外されたユーザーは `/mcp` が通らない」という不変条件が「1つのツールを除いて」になる。401 の本文にログイン名を含めないことも合わせてテストで固定した。
+
+**ホットパスのコスト**: リクエストごとに `ALLOWED_GITHUB_USERS`（数十バイト）を split / trim / toLowerCase する。同じリクエストで provider が既に行っている SHA-256（token id 生成）・AES 鍵アンラップ・props 復号や、`createMcpHandler` + `new McpServer` + Zod スキーマ6本の登録に比べれば計測に出ない。env 由来の結果をモジュールスコープにキャッシュする案は採らない —— [09] で「リクエスト間で共有される可変状態を増やさない」と決めた形を、このためだけに崩す価値が無い。
+
+**ソース位置**: `mcp.ts` の `isIdentityAllowed()` / `identityNotAllowedResponse()` / `mcpApiHandler`（入口側の判定は `github-handler.ts` の `GET /callback` に残置）
 
 ---
 

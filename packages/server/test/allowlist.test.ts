@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   githubGrantUserId,
+  githubNumericIdFromUserId,
   githubUserId,
   isGitHubUserAllowed,
   parseAllowedGitHubUsers,
@@ -117,6 +118,63 @@ describe("identity naming", () => {
     expect(() => githubUserId(-1)).toThrow();
     expect(() => githubUserId(1.5)).toThrow();
     expect(() => githubGrantUserId(Number.NaN)).toThrow();
+  });
+});
+
+// [15] The per-request allowlist check (mcp.ts) has only `props.user_id` to
+// work with, so it needs the inverse of `githubUserId()`. Anything this
+// function accepts becomes eligible to match a `github:<id>` allowlist entry,
+// which is why the accepted shape is the canonical output of `githubUserId()`
+// and nothing else.
+describe("githubNumericIdFromUserId", () => {
+  it("round-trips the canonical props identity", () => {
+    expect(githubNumericIdFromUserId(githubUserId(583231))).toBe(583231);
+    expect(githubNumericIdFromUserId("github:1")).toBe(1);
+  });
+
+  it("returns undefined for a missing value", () => {
+    expect(githubNumericIdFromUserId(undefined)).toBeUndefined();
+    expect(githubNumericIdFromUserId(null)).toBeUndefined();
+    expect(githubNumericIdFromUserId("")).toBeUndefined();
+  });
+
+  // `github:` is a namespace reservation (see githubUserId). Another IdP's
+  // identifier carrying the same digits must not borrow a github:<id> entry.
+  it("refuses another namespace, even with identical digits", () => {
+    expect(githubNumericIdFromUserId("google:583231")).toBeUndefined();
+    expect(githubNumericIdFromUserId("gitlab:583231")).toBeUndefined();
+    expect(githubNumericIdFromUserId("583231")).toBeUndefined();
+  });
+
+  it("refuses anything that is not exactly the canonical spelling", () => {
+    expect(githubNumericIdFromUserId("github:")).toBeUndefined();
+    expect(githubNumericIdFromUserId("github:583231extra")).toBeUndefined();
+    expect(githubNumericIdFromUserId("github:583231 ")).toBeUndefined();
+    expect(githubNumericIdFromUserId(" github:583231")).toBeUndefined();
+    expect(githubNumericIdFromUserId("github:58 3231")).toBeUndefined();
+    expect(githubNumericIdFromUserId("prefix-github:583231")).toBeUndefined();
+    // Non-canonical digits: `Number()` would happily yield 583231 here, and
+    // then a `github:583231` entry would match a props value nobody minted.
+    expect(githubNumericIdFromUserId("github:0583231")).toBeUndefined();
+    expect(githubNumericIdFromUserId("github:0")).toBeUndefined();
+  });
+
+  // Past 2^53 the digits and the Number stop agreeing, so the round-trip
+  // check drops the value rather than matching an id it cannot represent.
+  it("refuses ids beyond the safe integer range", () => {
+    expect(githubNumericIdFromUserId("github:9007199254740993")).toBeUndefined();
+  });
+
+  // The composition this exists for: recovered id + login, both handed to the
+  // same predicate the /callback gate uses.
+  it("feeds isGitHubUserAllowed so a numeric-id entry matches a live token", () => {
+    const id = githubNumericIdFromUserId("github:583231");
+    expect(isGitHubUserAllowed("renamed-octocat", id, "github:583231")).toBe(true);
+    expect(isGitHubUserAllowed("renamed-octocat", id, "github:999")).toBe(false);
+    // An unusable user_id costs the id notation but not the login notation.
+    const none = githubNumericIdFromUserId("google:583231");
+    expect(isGitHubUserAllowed("octocat", none, "github:583231")).toBe(false);
+    expect(isGitHubUserAllowed("octocat", none, "octocat")).toBe(true);
   });
 });
 

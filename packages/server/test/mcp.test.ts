@@ -1,6 +1,6 @@
 import { OPEN_STATUSES, type TaskDb } from "@todo-mcp/core";
 import { createMcpHandler } from "agents/mcp/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createTodoMcpServer, mcpApiHandler } from "../src/mcp";
 
@@ -147,6 +147,30 @@ describe("mcp handler", () => {
   });
 });
 
+/**
+ * [15] `mcpApiHandler` reads `ALLOWED_GITHUB_USERS` off `env` on every request,
+ * so every test that goes through it now needs a *complete* env, not `{}` —
+ * a blank allowlist is a deny (see `isGitHubUserAllowed`'s fail-closed rule).
+ * `PROPS.login` is what this value has to list.
+ */
+const ALLOWED_ENV = { ALLOWED_GITHUB_USERS: "octocat" };
+
+/** props as OAuthProvider hands them over: identity plus the granted scopes. */
+const SCOPED_PROPS = { ...PROPS, scopes: ["todo"] };
+
+function callApi(
+  env: Record<string, unknown>,
+  method: string,
+  params: Record<string, unknown>,
+  options: { props?: Record<string, unknown>; url?: string } = {},
+): Promise<Response> {
+  return mcpApiHandler.fetch(
+    buildMcpRequest(method, params, options.url),
+    env,
+    ctxWithProps(options.props ?? SCOPED_PROPS),
+  );
+}
+
 // [scope enforcement] mcpApiHandler is the actual OAuthProvider apiHandler
 // (index.ts). OAuthProvider decrypts the grant's props into `ctx.props`
 // before calling it, which is exactly what these tests inject directly —
@@ -154,10 +178,11 @@ describe("mcp handler", () => {
 // via `authContext` and never exercise this scope check at all.
 describe("scope enforcement (mcpApiHandler)", () => {
   it("returns 403 insufficient_scope when props.scopes lacks \"todo\"", async () => {
-    const response = await mcpApiHandler.fetch(
-      buildMcpRequest("tools/call", { name: "whoami", arguments: {} }),
-      {},
-      ctxWithProps({ ...PROPS, scopes: [] }),
+    const response = await callApi(
+      ALLOWED_ENV,
+      "tools/call",
+      { name: "whoami", arguments: {} },
+      { props: { ...PROPS, scopes: [] } },
     );
 
     expect(response.status).toBe(403);
@@ -169,15 +194,246 @@ describe("scope enforcement (mcpApiHandler)", () => {
   });
 
   it("allows the call through when props.scopes includes \"todo\" (ctx.props, the real OAuthProvider channel)", async () => {
-    const response = await mcpApiHandler.fetch(
-      buildMcpRequest("tools/call", { name: "whoami", arguments: {} }),
-      {},
-      ctxWithProps({ ...PROPS, scopes: ["todo"] }),
-    );
+    const response = await callApi(ALLOWED_ENV, "tools/call", { name: "whoami", arguments: {} });
     const result = await parseMcpResult(response);
 
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toEqual(PROPS);
+  });
+});
+
+/**
+ * [15] The invariant: an identity dropped from ALLOWED_GITHUB_USERS cannot use
+ * an already-issued token. Before this ticket `isGitHubUserAllowed()` was
+ * called from exactly one place — `github-handler.ts`'s `GET /callback` — so
+ * the allowlist only gated *minting* a grant and every live token outlived any
+ * change to it.
+ *
+ * These tests all go through `mcpApiHandler`, the real OAuthProvider
+ * `apiHandler`, because that is where the check lives. The `mcp handler` block
+ * further up injects props via `authContext` straight into the SDK handler and
+ * bypasses this gate entirely, exactly as it already bypasses the scope check.
+ */
+describe("allowlist enforcement per request (mcpApiHandler) [15]", () => {
+  /** Every JSON-RPC entry point `/mcp` exposes: tools, the resource, the prompt. */
+  const ENTRY_POINTS: { name: string; method: string; params: Record<string, unknown> }[] = [
+    { name: "tools/list", method: "tools/list", params: {} },
+    { name: "whoami", method: "tools/call", params: { name: "whoami", arguments: {} } },
+    { name: "get_agenda", method: "tools/call", params: { name: "get_agenda", arguments: {} } },
+    {
+      name: "upsert_task",
+      method: "tools/call",
+      params: { name: "upsert_task", arguments: { title: "新しいタスク" } },
+    },
+    {
+      name: "search_tasks",
+      method: "tools/call",
+      params: { name: "search_tasks", arguments: {} },
+    },
+    {
+      name: "complete_task",
+      method: "tools/call",
+      params: { name: "complete_task", arguments: { id: 1 } },
+    },
+    { name: "get_task", method: "tools/call", params: { name: "get_task", arguments: { id: 1 } } },
+    { name: "resources/read", method: "resources/read", params: { uri: "todo://today" } },
+    { name: "prompts/get", method: "prompts/get", params: { name: "todo-review" } },
+  ];
+
+  describe("a dropped identity is refused on every entry point", () => {
+    for (const { name, method, params } of ENTRY_POINTS) {
+      it(`${name} returns 401 invalid_token`, async () => {
+        // Same token, same props — only the deployed allowlist changed.
+        const response = await callApi({ ALLOWED_GITHUB_USERS: "someone-else" }, method, params);
+
+        expect(response.status).toBe(401);
+        const body = await response.text();
+        expect((JSON.parse(body) as { error?: string }).error).toBe("invalid_token");
+        // The refusal must not double as an identity oracle: whoami's answer
+        // (the login) is exactly what a dropped user must not get back.
+        expect(body).not.toContain("octocat");
+      });
+    }
+  });
+
+  describe("a listed identity keeps every entry point (no behaviour change)", () => {
+    for (const { name, method, params } of ENTRY_POINTS) {
+      it(`${name} reaches the MCP layer`, async () => {
+        // No `?workspace=` on purpose: every entry point then answers with a
+        // JSON-RPC *result* (the workspace-missing body for the three
+        // workspace-taking tools, a real body for the rest). With
+        // `?workspace=life` the resource handler's `openDb()` throw surfaces
+        // as a JSON-RPC error instead — a distinction about Turso config, not
+        // about the gate, which is what this test is pinning.
+        const response = await callApi(ALLOWED_ENV, method, params);
+
+        expect(response.status).toBe(200);
+        // `parseMcpResult` asserts a JSON-RPC `result` came back, i.e. the
+        // request was handled by the MCP server rather than the gate.
+        await expect(parseMcpResult(response)).resolves.toBeDefined();
+      });
+    }
+
+    // The five tools all end at `deps.openDb()`, which throws without Turso
+    // config. Reaching *that* error is the proof they cleared the gate; their
+    // query behaviour is covered by the fakeTaskDb suites below.
+    it("the five todo tools reach the DB-opening step rather than a gate rejection", async () => {
+      for (const tool of ENTRY_POINTS.filter((e) =>
+        ["get_agenda", "upsert_task", "search_tasks", "complete_task", "get_task"].includes(e.name),
+      )) {
+        const response = await callApi(ALLOWED_ENV, tool.method, tool.params, {
+          url: "http://localhost:8788/mcp?workspace=life",
+        });
+        const result = await parseMcpResult(response);
+
+        expect(result.isError).toBe(true);
+        expect(toolText(result)).toContain("サーバー設定エラー: TURSO_DATABASE_URL");
+      }
+    });
+
+    it("whoami still answers with the identity", async () => {
+      const result = await parseMcpResult(
+        await callApi(ALLOWED_ENV, "tools/call", { name: "whoami", arguments: {} }),
+      );
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toEqual(PROPS);
+    });
+
+    it("the resource and the prompt still return their own bodies", async () => {
+      const resource = await parseMcpResult(
+        await callApi(ALLOWED_ENV, "resources/read", { uri: "todo://today" }),
+      );
+      // No `?workspace=`, so this is the workspace-missing body — proof the
+      // resource handler itself ran (the gate never produces this text).
+      const contents = resource.contents as Array<{ text: string }>;
+      expect(contents[0]?.text).toContain("不正な値: workspace=(未指定)");
+
+      const prompt = await parseMcpResult(
+        await callApi(ALLOWED_ENV, "prompts/get", { name: "todo-review" }),
+      );
+      const messages = prompt.messages as Array<{ content: { text: string } }>;
+      expect(messages[0]?.content.text).toContain("get_agenda");
+    });
+  });
+
+  // [M-3/P2-1] The allowlist accepts both notations, and the per-request check
+  // has to honour both — otherwise an operator who wrote the rename-proof
+  // `github:<id>` form would find their own live tokens refused.
+  describe("both allowlist notations work per request", () => {
+    it("matches the numeric-id notation recovered from props.user_id", async () => {
+      const response = await callApi({ ALLOWED_GITHUB_USERS: "github:583231" }, "tools/call", {
+        name: "whoami",
+        arguments: {},
+      });
+      expect(response.status).toBe(200);
+    });
+
+    it("matches by id even after the GitHub login was renamed", async () => {
+      const response = await callApi(
+        { ALLOWED_GITHUB_USERS: "github:583231" },
+        "tools/call",
+        { name: "whoami", arguments: {} },
+        { props: { login: "renamed-octocat", user_id: "github:583231", scopes: ["todo"] } },
+      );
+      expect(response.status).toBe(200);
+    });
+
+    it("refuses a different numeric id", async () => {
+      const response = await callApi({ ALLOWED_GITHUB_USERS: "github:999" }, "tools/call", {
+        name: "whoami",
+        arguments: {},
+      });
+      expect(response.status).toBe(401);
+    });
+  });
+
+  // [15] Recovering the numeric id from `props.user_id` must not be loose:
+  // `github:` is a namespace reservation, so a value from another namespace —
+  // or a non-canonical spelling of the same digits — must never satisfy a
+  // `github:<id>` entry.
+  describe("numeric id recovery from props.user_id is strict", () => {
+    const REJECTED_USER_IDS = [
+      "google:583231", // another IdP's namespace, same digits
+      "583231", // bare id, no namespace
+      "github:583231extra", // trailing junk
+      "github:0583231", // non-canonical spelling
+      "github:", // prefix only
+      " github:583231", // leading space
+    ];
+
+    for (const userId of REJECTED_USER_IDS) {
+      it(`user_id ${JSON.stringify(userId)} does not satisfy a github:<id> entry`, async () => {
+        const response = await callApi(
+          { ALLOWED_GITHUB_USERS: "github:583231" },
+          "tools/call",
+          { name: "whoami", arguments: {} },
+          { props: { login: "octocat", user_id: userId, scopes: ["todo"] } },
+        );
+        expect(response.status).toBe(401);
+      });
+    }
+
+    it("an unusable user_id still allows a plain login entry to match", async () => {
+      const response = await callApi(
+        ALLOWED_ENV,
+        "tools/call",
+        { name: "whoami", arguments: {} },
+        { props: { login: "octocat", user_id: "google:583231", scopes: ["todo"] } },
+      );
+      expect(response.status).toBe(200);
+    });
+  });
+
+  // Fail-closed, unchanged from `isGitHubUserAllowed`'s existing treatment: a
+  // deploy that loses the secret locks everybody out instead of admitting
+  // every GitHub account. The per-request check inherits that rule rather than
+  // carving out an "unset means allow the already-issued tokens" exception.
+  describe("unset or blank ALLOWED_GITHUB_USERS still means nobody", () => {
+    const BLANK_ENVS: { label: string; env: Record<string, unknown> }[] = [
+      { label: "unset", env: {} },
+      { label: "empty string", env: { ALLOWED_GITHUB_USERS: "" } },
+      { label: "whitespace", env: { ALLOWED_GITHUB_USERS: "   " } },
+      { label: "commas only", env: { ALLOWED_GITHUB_USERS: ",," } },
+    ];
+
+    for (const { label, env } of BLANK_ENVS) {
+      it(`${label} refuses a token that was valid a moment ago`, async () => {
+        const response = await callApi(env, "tools/call", { name: "whoami", arguments: {} });
+        expect(response.status).toBe(401);
+      });
+    }
+  });
+
+  it("answers with the provider's own 401 shape so a client knows to re-authenticate", async () => {
+    const response = await callApi({ ALLOWED_GITHUB_USERS: "someone-else" }, "tools/list", {});
+
+    expect(response.status).toBe(401);
+    const wwwAuthenticate = response.headers.get("WWW-Authenticate") ?? "";
+    expect(wwwAuthenticate).toContain('error="invalid_token"');
+    // RFC 9728 discovery pointer, same construction as the provider's own 401s
+    // (`handleApiRequest`) — this is what makes a client start the auth flow.
+    expect(wwwAuthenticate).toContain(
+      'resource_metadata="http://localhost:8788/.well-known/oauth-protected-resource/mcp"',
+    );
+    expect(wwwAuthenticate).toContain('scope="todo"');
+    // 403 would be the *other* candidate; pinning the code keeps that decision
+    // from being reversed silently (docs/design-notes.md [15]).
+    expect(response.status).not.toBe(403);
+  });
+
+  it("does not revoke the grant: refusing is a read-only decision", async () => {
+    const revokeGrant = vi.fn();
+    const response = await callApi(
+      { ALLOWED_GITHUB_USERS: "someone-else", OAUTH_PROVIDER: { revokeGrant } },
+      "tools/call",
+      { name: "whoami", arguments: {} },
+    );
+
+    expect(response.status).toBe(401);
+    // Re-adding the user to ALLOWED_GITHUB_USERS has to restore access without
+    // every device re-authorising; destroying the grant here would make a
+    // mistaken removal irreversible (docs/design-notes.md [15]).
+    expect(revokeGrant).not.toHaveBeenCalled();
   });
 });
 

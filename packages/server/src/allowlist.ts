@@ -63,6 +63,27 @@ export function githubUserId(numericId: number): string {
 }
 
 /**
+ * `githubUserId()` の逆。props の `user_id` から数値 ID を復元する。
+ *
+ * [15] `/mcp` のリクエストごとの allowlist 照合が `isGitHubUserAllowed()` の
+ * 第2引数に渡すもの。復元できない形（別 IdP の名前空間、接頭辞なし、非正規な
+ * 桁表記、桁あふれ）は `undefined` を返す —— `github:<数値ID>` 形式のエントリと
+ * 一致しなくなるだけで、ログイン名エントリでの一致は妨げない（フェイルクローズ）。
+ * 詳細は docs/design-notes.md 参照。
+ */
+export function githubNumericIdFromUserId(userId: string | undefined | null): number | undefined {
+  if (!userId) return undefined;
+  // props の `user_id` は `githubUserId()` が作るので、allowlist の
+  // `github:<数値ID>` エントリとまったく同じ構文になる。だから同じパターンで判定できる。
+  const match = GITHUB_ID_ENTRY.exec(userId);
+  if (!match) return undefined;
+  const numericId = Number(match[1]);
+  if (!Number.isSafeInteger(numericId) || numericId <= 0) return undefined;
+  // 正規形との往復で確認する（`github:007` のような非正規表記をここで落とす）。
+  return githubUserId(numericId) === userId ? numericId : undefined;
+}
+
+/**
  * OAuthProvider.completeAuthorization() に渡す `userId`。
  *
  * ':' を含んではいけない。理由は docs/design-notes.md 参照
