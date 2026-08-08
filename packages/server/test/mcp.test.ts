@@ -2,7 +2,7 @@ import { OPEN_STATUSES, type TaskDb } from "@todo-mcp/core";
 import { createMcpHandler } from "agents/mcp/server";
 import { describe, expect, it, vi } from "vitest";
 
-import { createTodoMcpServer, mcpApiHandler } from "../src/mcp";
+import { createTodoMcpServer, mcpApiHandler, withAllowlistGate } from "../src/mcp";
 
 /**
  * `whoami` never touches Turso, so these tests hand it a database that fails
@@ -64,6 +64,27 @@ function buildMcpRequest(
       "MCP-Protocol-Version": "2025-06-18",
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+}
+
+/**
+ * [15] The same `/mcp` request minus the JSON-RPC single-call assumption.
+ *
+ * `buildMcpRequest` can only make one shape: `POST` carrying one JSON-RPC
+ * object. The transport also accepts other verbs and a JSON-RPC *batch*, and
+ * the gate has to cover those too — so those tests need to build the request
+ * themselves.
+ */
+function buildRawMcpRequest(init: { method: string; body?: string }): Request {
+  return new Request("http://localhost:8788/mcp", {
+    method: init.method,
+    headers: {
+      Host: "localhost:8788",
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      "MCP-Protocol-Version": "2025-06-18",
+    },
+    ...(init.body === undefined ? {} : { body: init.body }),
   });
 }
 
@@ -158,20 +179,41 @@ const ALLOWED_ENV = { ALLOWED_GITHUB_USERS: "octocat" };
 /** props as OAuthProvider hands them over: identity plus the granted scopes. */
 const SCOPED_PROPS = { ...PROPS, scopes: ["todo"] };
 
+/**
+ * [15] What index.ts actually wires as OAuthProvider's `apiHandler`: the
+ * allowlist gate wrapped around the MCP handler.
+ *
+ * Composing it here rather than calling `mcpApiHandler.fetch` directly is what
+ * lets these tests observe the *order* of the two checks. The gate lives in the
+ * wrapper and the scope check lives inside `mcpApiHandler`, so a change that
+ * moves the gate behind the scope check is visible from out here (see "refuses
+ * before the scope check" below). That index.ts really wires this composition
+ * — and not the bare handler — is pinned separately in test/wiring.test.ts.
+ */
+const GATED_API_HANDLER = withAllowlistGate(mcpApiHandler);
+
 function callApi(
   env: Record<string, unknown>,
   method: string,
   params: Record<string, unknown>,
   options: { props?: Record<string, unknown>; url?: string } = {},
 ): Promise<Response> {
-  return mcpApiHandler.fetch(
+  return GATED_API_HANDLER.fetch(
     buildMcpRequest(method, params, options.url),
     env,
     ctxWithProps(options.props ?? SCOPED_PROPS),
   );
 }
 
-// [scope enforcement] mcpApiHandler is the actual OAuthProvider apiHandler
+function callApiRaw(
+  env: Record<string, unknown>,
+  request: Request,
+  props: Record<string, unknown> = SCOPED_PROPS,
+): Promise<Response> {
+  return GATED_API_HANDLER.fetch(request, env, ctxWithProps(props));
+}
+
+// [scope enforcement] `GATED_API_HANDLER` is the actual OAuthProvider apiHandler
 // (index.ts). OAuthProvider decrypts the grant's props into `ctx.props`
 // before calling it, which is exactly what these tests inject directly —
 // unlike the `mcp handler` tests above, which go through the raw SDK handler
@@ -191,6 +233,12 @@ describe("scope enforcement (mcpApiHandler)", () => {
     expect(wwwAuthenticate).toContain('scope="todo"');
     const body = (await response.json()) as { error?: string };
     expect(body.error).toBe("insufficient_scope");
+    // [provider response shape] Hand-built responses have to carry the
+    // no-cache headers the provider puts on every error response of its own,
+    // or an intermediary may serve a stale 403 after the grant was widened.
+    // The shared shape is checked against the real library in
+    // test/provider-response-shape.test.ts.
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
   });
 
   it("allows the call through when props.scopes includes \"todo\" (ctx.props, the real OAuthProvider channel)", async () => {
@@ -209,14 +257,29 @@ describe("scope enforcement (mcpApiHandler)", () => {
  * the allowlist only gated *minting* a grant and every live token outlived any
  * change to it.
  *
- * These tests all go through `mcpApiHandler`, the real OAuthProvider
- * `apiHandler`, because that is where the check lives. The `mcp handler` block
- * further up injects props via `authContext` straight into the SDK handler and
- * bypasses this gate entirely, exactly as it already bypasses the scope check.
+ * These tests all go through `GATED_API_HANDLER` — `withAllowlistGate()` around
+ * `mcpApiHandler`, which is the composition index.ts hands OAuthProvider as its
+ * `apiHandler`. The check lives in the wrapper, not in `mcpApiHandler` itself
+ * (see the wrapper's own doc comment for why). The `mcp handler` block further
+ * up injects props via `authContext` straight into the SDK handler and bypasses
+ * this gate entirely, exactly as it already bypasses the scope check.
  */
 describe("allowlist enforcement per request (mcpApiHandler) [15]", () => {
-  /** Every JSON-RPC entry point `/mcp` exposes: tools, the resource, the prompt. */
+  /** Every JSON-RPC entry point `/mcp` exposes: the handshake, tools, the resource, the prompt. */
   const ENTRY_POINTS: { name: string; method: string; params: Record<string, unknown> }[] = [
+    // `initialize` is the *first* thing any client sends, so it is the one
+    // entry point a dropped identity is guaranteed to hit. Leaving it out of
+    // this list meant the headline claim ("initialize is covered too", see
+    // docs/design-notes.md [15]) rested on nothing.
+    {
+      name: "initialize",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "test-client", version: "0.0.0" },
+      },
+    },
     { name: "tools/list", method: "tools/list", params: {} },
     { name: "whoami", method: "tools/call", params: { name: "whoami", arguments: {} } },
     { name: "get_agenda", method: "tools/call", params: { name: "get_agenda", arguments: {} } },
@@ -316,6 +379,76 @@ describe("allowlist enforcement per request (mcpApiHandler) [15]", () => {
     });
   });
 
+  /**
+   * [15] The entry-point list above only covers one transport shape: a POST
+   * carrying a single JSON-RPC object. `/mcp` accepts more than that, and the
+   * gate is a property of the *route*, not of the JSON-RPC method — so a shape
+   * the list can't express is exactly where a future change could open a hole.
+   *
+   * Two are pinned here, chosen for what could plausibly break them:
+   *  - `GET /mcp` — today the transport answers 405 because `legacy:
+   *    'stateless'` has no SSE stream to open. Turning sessions on (or moving
+   *    off `stateless`) makes GET a real, data-bearing channel. If the gate
+   *    were ever placed *inside* the JSON-RPC dispatch instead of in front of
+   *    the route, that new channel would be born ungated.
+   *  - a JSON-RPC batch — one request carrying several calls. A gate that
+   *    inspected `body.method` (rather than gating the request) would read
+   *    `undefined` on a batch and could fall through; here the whole batch is
+   *    refused or served as one unit.
+   * `DELETE /mcp` rides along with GET: same non-POST verb class, one extra line.
+   */
+  describe("the gate covers transport shapes the entry-point list can't express", () => {
+    const BATCH_BODY = JSON.stringify([
+      { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "whoami", arguments: {} } },
+    ]);
+
+    const SHAPES: { name: string; build: () => Request }[] = [
+      { name: "GET /mcp", build: () => buildRawMcpRequest({ method: "GET" }) },
+      { name: "DELETE /mcp", build: () => buildRawMcpRequest({ method: "DELETE" }) },
+      {
+        name: "a JSON-RPC batch POST",
+        build: () => buildRawMcpRequest({ method: "POST", body: BATCH_BODY }),
+      },
+    ];
+
+    for (const { name, build } of SHAPES) {
+      it(`${name} is refused for a dropped identity`, async () => {
+        const response = await callApiRaw({ ALLOWED_GITHUB_USERS: "someone-else" }, build());
+
+        expect(response.status).toBe(401);
+        const body = await response.text();
+        expect((JSON.parse(body) as { error?: string }).error).toBe("invalid_token");
+        expect(body).not.toContain("octocat");
+      });
+    }
+
+    // Without these the refusals above would be vacuous: a shape the transport
+    // rejects on its own terms would "pass" the gate test for the wrong reason.
+    it("GET and DELETE reach the transport for a listed identity", async () => {
+      for (const method of ["GET", "DELETE"]) {
+        const response = await callApiRaw(ALLOWED_ENV, buildRawMcpRequest({ method }));
+
+        expect(response.status).not.toBe(401);
+        // The transport's own JSON-RPC answer, i.e. the request got past the
+        // gate and past the scope check. Its exact status is the SDK's business.
+        expect(await response.text()).toContain('"jsonrpc"');
+      }
+    });
+
+    it("a batch is served in full for a listed identity", async () => {
+      const response = await callApiRaw(
+        ALLOWED_ENV,
+        buildRawMcpRequest({ method: "POST", body: BATCH_BODY }),
+      );
+
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain('"tools"');
+      expect(body).toContain("github:583231");
+    });
+  });
+
   // [M-3/P2-1] The allowlist accepts both notations, and the per-request check
   // has to honour both — otherwise an operator who wrote the rename-proof
   // `github:<id>` form would find their own live tokens refused.
@@ -404,6 +537,56 @@ describe("allowlist enforcement per request (mcpApiHandler) [15]", () => {
     }
   });
 
+  /**
+   * [15/ordering] The gate is evaluated *before* the scope check.
+   *
+   * Nothing pinned this before: moving the allowlist block behind the scope
+   * check left all 171 tests green, because every allowlist test happened to
+   * carry a `todo`-scoped token and every scope test happened to be listed.
+   * The two orders only differ for a token that fails *both*, which is exactly
+   * the token a token-widening client would be told to fetch: a 403
+   * `insufficient_scope` says "this grant needs higher privileges", i.e. "come
+   * back with a broader token and you are in". For a dropped identity that is a
+   * lie, and it costs the reason 401 was chosen — the re-auth that makes "you
+   * are no longer allowed" visible to a human (docs/design-notes.md [15] 判断1).
+   */
+  describe("the allowlist is evaluated before the scope check", () => {
+    /** Fails both checks: dropped from the allowlist *and* holding no scopes. */
+    const UNSCOPED_PROPS = { ...PROPS, scopes: [] };
+
+    it("refuses a dropped, scope-less token with 401 invalid_token, not 403 insufficient_scope", async () => {
+      const response = await callApi(
+        { ALLOWED_GITHUB_USERS: "someone-else" },
+        "tools/call",
+        { name: "whoami", arguments: {} },
+        { props: UNSCOPED_PROPS },
+      );
+
+      expect(response.status).toBe(401);
+      expect(response.status).not.toBe(403);
+      const body = (await response.json()) as { error?: string };
+      expect(body.error).toBe("invalid_token");
+      expect(body.error).not.toBe("insufficient_scope");
+      const wwwAuthenticate = response.headers.get("WWW-Authenticate") ?? "";
+      expect(wwwAuthenticate).toContain('error="invalid_token"');
+      expect(wwwAuthenticate).not.toContain("insufficient_scope");
+    });
+
+    // The other half of the ordering claim: the scope check is still reachable,
+    // so this is about *precedence*, not about the gate having eaten it.
+    it("still answers 403 insufficient_scope when the identity is listed", async () => {
+      const response = await callApi(
+        ALLOWED_ENV,
+        "tools/call",
+        { name: "whoami", arguments: {} },
+        { props: UNSCOPED_PROPS },
+      );
+
+      expect(response.status).toBe(403);
+      expect(((await response.json()) as { error?: string }).error).toBe("insufficient_scope");
+    });
+  });
+
   it("answers with the provider's own 401 shape so a client knows to re-authenticate", async () => {
     const response = await callApi({ ALLOWED_GITHUB_USERS: "someone-else" }, "tools/list", {});
 
@@ -416,9 +599,71 @@ describe("allowlist enforcement per request (mcpApiHandler) [15]", () => {
       'resource_metadata="http://localhost:8788/.well-known/oauth-protected-resource/mcp"',
     );
     expect(wwwAuthenticate).toContain('scope="todo"');
+    // [provider response shape] Same reason as the 403 above; the shared shape
+    // is checked against the real library in test/provider-response-shape.test.ts.
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
     // 403 would be the *other* candidate; pinning the code keeps that decision
     // from being reversed silently (docs/design-notes.md [15]).
     expect(response.status).not.toBe(403);
+  });
+
+  /**
+   * [15/diagnosability] Losing the `ALLOWED_GITHUB_USERS` secret and being
+   * dropped from a populated allowlist are the same 401 on the wire, on
+   * purpose — telling an unauthenticated caller "this server is misconfigured"
+   * hands them server state they have no business knowing. But the two are
+   * completely different incidents for the operator: `wrangler.jsonc` keeps
+   * this name out of `vars` deliberately, so a deploy that forgets the secret
+   * locks every live machine out at once with nothing on the wire to say so.
+   * The log line is the only place the difference can live.
+   */
+  describe("a refusal says in the log which of the two reasons it was", () => {
+    async function refusalLog(env: Record<string, unknown>): Promise<string[]> {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const response = await callApi(env, "tools/call", { name: "whoami", arguments: {} });
+        expect(response.status).toBe(401);
+        return log.mock.calls.map((args) => String(args[0]));
+      } finally {
+        log.mockRestore();
+      }
+    }
+
+    it("distinguishes an empty allowlist from an identity that is not on it", async () => {
+      const emptyLines = await refusalLog({});
+      const droppedLines = await refusalLog({ ALLOWED_GITHUB_USERS: "someone-else" });
+
+      expect(emptyLines.join("\n")).toContain(
+        '[mcp] {"event":"identity_not_allowed","reason":"allowlist_empty"',
+      );
+      expect(droppedLines.join("\n")).toContain(
+        '[mcp] {"event":"identity_not_allowed","reason":"identity_not_listed"',
+      );
+      // Blank spellings are the same incident as "unset" — a lost secret.
+      for (const blank of ["", "   ", ",,"]) {
+        expect((await refusalLog({ ALLOWED_GITHUB_USERS: blank })).join("\n")).toContain(
+          '"reason":"allowlist_empty"',
+        );
+      }
+    });
+
+    it("keeps the two refusals identical on the wire", async () => {
+      const empty = await callApi({}, "tools/call", { name: "whoami", arguments: {} });
+      const dropped = await callApi(
+        { ALLOWED_GITHUB_USERS: "someone-else" },
+        "tools/call",
+        { name: "whoami", arguments: {} },
+      );
+
+      const emptyBody = await empty.text();
+      expect(empty.status).toBe(dropped.status);
+      expect(emptyBody).toBe(await dropped.text());
+      expect([...empty.headers.entries()].sort()).toEqual([...dropped.headers.entries()].sort());
+      // Neither spelling of the reason may leak into the response.
+      const wire = JSON.stringify([empty.status, [...empty.headers.entries()], emptyBody]);
+      expect(wire).not.toContain("allowlist_empty");
+      expect(wire).not.toContain("identity_not_listed");
+    });
   });
 
   it("does not revoke the grant: refusing is a read-only decision", async () => {

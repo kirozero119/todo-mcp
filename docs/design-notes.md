@@ -58,6 +58,10 @@
   - [09/レビュー] types.ts / turso.ts のコメントを実装に合わせて訂正した
   - [09/レビュー] 不正な `?workspace=` クエリ値をエラー文にエコーする
   - [15] allowlist を `/mcp` のリクエストごとに再評価する
+  - [15/レビュー] ゲートを「配線の性質」にする（withAllowlistGate）
+  - [15/レビュー] refresh_token 時の allowlist 照合（tokenExchangeCallback）を採らない
+  - [15/レビュー] 拒否の理由はログでだけ分ける（応答は同一）
+  - [15/レビュー] provider の応答形を手で組み直している箇所の正本と drift 検出
 - [packages/core](#packagescore)
   - [09] core / server の境界をどこで切ったか
   - [09] user_id スコープを「grep で確認できる」形に保つ
@@ -391,7 +395,7 @@
 
 **`ALLOWED_GITHUB_USERS` からユーザーを外しても、失くした端末だけを切ることはできない**。チケット 15 以降、allowlist から外れたユーザーは `/mcp` のリクエストごとに 401 で拒否されるので、「そのユーザーを丸ごと止める」ことは allowlist だけでできる（KV を触る必要は無い）。ただし単位が**ユーザー**なので自分の他の端末も同時に止まり、しかも拒否は読み取りだけで grant を revoke しない判断をしている（mcp.ts の「[15] allowlist を `/mcp` のリクエストごとに再評価する」参照）ため、allowlist に書き戻すと**失くした端末の grant も一緒に生き返る**。端末単位で切る手段は、以下の KV 削除のままである。
 
-> この段落は以前「外しても生きている grant は切れない」と書いていた。`isGitHubUserAllowed()` の呼び出しが `GET /callback` の1箇所しか無かった当時は正しかったが、チケット 15 で `mcpApiHandler` が同じ照合をリクエストごとに行うようになったため無効になった記述。
+> この段落は以前「外しても生きている grant は切れない」と書いていた。`isGitHubUserAllowed()` の呼び出しが `GET /callback` の1箇所しか無かった当時は正しかったが、チケット 15 で `withAllowlistGate()` が同じ照合をリクエストごとに行うようになったため無効になった記述。
 
 **実際の手順**（`packages/server` で実行。namespace は `wrangler.jsonc` の `OAUTH_KV` バインディング）:
 
@@ -566,7 +570,7 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 
 **問題**: `isGitHubUserAllowed()` の呼び出しは `github-handler.ts` の `GET /callback` の **1 箇所しか無かった**。認可の瞬間にしか照合していないので、`ALLOWED_GITHUB_USERS` から外したユーザーは発行済みトークンでそのままアクセスし続けられる —— access token は最長1時間、refresh を回せば grant の30日いっぱい使える。**allowlist が「入口の鍵」であって「継続的な権限」ではない**状態だった。松本さん個人の運用では実害がほぼ無い（載っているのは本人1人で外す場面が無い）が、セルフホスト前提の OSS として公開すると、設定項目の意味と実際の効果が食い違っていることになる。
 
-**対応**: `mcpApiHandler`（＝ OAuthProvider の `apiHandler`。scope 強制と同じ場所）で、`ctx.props` の身元を `env.ALLOWED_GITHUB_USERS` と毎リクエスト突き合わせる。`/mcp` は tools / resources / prompts / initialize がすべて同じ POST なので、この1箇所が全経路のゲートになる —— Resource `todo://today`、Prompt `todo-review`、`whoami` も自動的にカバーされる（テストで9経路を列挙して固定した）。**`/callback` 側の判定は外さない**。多層防御であって置き換えではなく、「外れたユーザーに新しい grant を作らせない」という入口の意味はそのまま要る。
+**対応**: OAuthProvider の `apiHandler` に渡すものを `withAllowlistGate()` で包み（index.ts の配線。理由は下の「[15/レビュー] ゲートを『配線の性質』にする」）、`ctx.props` の身元を `env.ALLOWED_GITHUB_USERS` と毎リクエスト突き合わせる。ゲートはルート単位なので、`/mcp` に来るものは JSON-RPC のメソッドを問わず全部くぐる —— `initialize` を含む 10 の JSON-RPC 経路（tools / resources / prompts / `whoami`）に加えて、非 POST（`GET` / `DELETE`）と JSON-RPC バッチもカバーされる（テストで固定した。何を選んだかは同テストのコメント）。**`/callback` 側の判定は外さない**。多層防御であって置き換えではなく、「外れたユーザーに新しい grant を作らせない」という入口の意味はそのまま要る。
 
 **判断1: 拒否は 401 `invalid_token`（403 ではない）**
 
@@ -581,6 +585,8 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 **この選択で受け入れたもの**: 外された人の端末は「ブラウザが開く → 拒否される」を繰り返す可能性がある。これは避けたいコストではなく③で欲しかったものそのもの（黙って失敗し続けるより、拒否が見えるほうがよい）。
 
 **未検証**: Claude Code が実際にこの 401 でブラウザを開くところは、デプロイしないと観測できない（チケット 15 の作業はデプロイ禁止）。根拠は仕様と、同じ形の 401 で初回認証が現に成立している実績まで。
+
+> **README との整合（レビュー指摘、訂正済み）**: README は当初「許可リストに書き戻せばそのまま元に戻る（トークンを revoke しないため、端末の再認可も要らない）」と断定していた。前半（grant を消さない・`/token` に allowlist 判定が無い ＝ サーバーは同じトークンを再び受け付ける）はサーバー側で検証済みだが、**後半はクライアント側の挙動**（401 を受けた端末がキャッシュ済みの grant を捨てるかどうか）で、このリポジトリの管轄外。同じ理由で「クライアントはこの 401 で再認証を試み」も断定できない —— それこそがこの「未検証」の中身だから。README をサーバー側で確かめた範囲と、クライアント依存の範囲に分けて書き直した。
 
 **判断2: 拒否時に grant / token を revoke しない**
 
@@ -605,7 +611,65 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 
 **ホットパスのコスト**: リクエストごとに `ALLOWED_GITHUB_USERS`（数十バイト）を split / trim / toLowerCase する。同じリクエストで provider が既に行っている SHA-256（token id 生成）・AES 鍵アンラップ・props 復号や、`createMcpHandler` + `new McpServer` + Zod スキーマ6本の登録に比べれば計測に出ない。env 由来の結果をモジュールスコープにキャッシュする案は採らない —— [09] で「リクエスト間で共有される可変状態を増やさない」と決めた形を、このためだけに崩す価値が無い。
 
-**ソース位置**: `mcp.ts` の `isIdentityAllowed()` / `identityNotAllowedResponse()` / `mcpApiHandler`（入口側の判定は `github-handler.ts` の `GET /callback` に残置）
+**ソース位置**: `mcp.ts` の `isIdentityAllowed()` / `allowlistDenialReason()` / `identityNotAllowedResponse()` / `withAllowlistGate()`、配線は `index.ts` の `apiHandler`（入口側の判定は `github-handler.ts` の `GET /callback` に残置）
+
+### [15/レビュー] ゲートを「配線の性質」にする（withAllowlistGate）
+
+**問題1（順序が何にも守られていなかった）**: 判定は「scope チェックより先」に置いてあり、mcp.ts のコメントにも本ドキュメントにも理由つきで書いてあった。ところが**その順序を守っているか確かめるものが何も無かった** —— レビュアがブロックを scope チェックの後ろに動かす変異を当てたところ、171 件のテストが全部通った。allowlist のテストはどれも `todo` scope 付きのトークンを持ち、scope のテストはどれも許可リストに載った身元で、**両方に落ちるトークン**を誰も試していなかったから。順序が逆だと、scope を持たず allowlist からも外れたユーザーが `403 insufficient_scope` を受け取る。これは「もっと広い権限のトークンを取り直せば通る」という嘘の含意になり、401 を選んだ理由（判断1 の③、「もう許可されていない」が人間に見える）がその経路で失われる。
+
+**問題2（ゲートが 1 関数の本体の性質だった）**: 判定は `mcpApiHandler.fetch` の**中**にあった。provider は `apiHandlers`（route → handler のマップ）も受け付けるので、将来 2 本目の認証済みルートを足した人は、ゲートを掛けたつもりが無いまま同じトークンで通せるハンドラを公開できる。「認証済みの全ルートが allowlist を再評価する」という不変条件が、mcp.ts の本文だけで担保されていた。
+
+**対応**: 判定を `withAllowlistGate(handler)` というラッパーに出し、index.ts で `apiHandler: withAllowlistGate(mcpApiHandler)` と配線する。
+
+- 順序は**構造で**決まる。ラッパーは中のハンドラより必ず先に走るので、allowlist は `mcpApiHandler` の中にある scope チェックより常に先。
+- ルートを足す人は provider に渡すものを書く時点で「ゲートを掛ける／掛けない」を明示的に選ぶことになる。
+- ただし「構造的に不可能」ではない（`apiHandlers: { "/x": bareHandler }` と書けてしまう）ので、テストで塞ぐ: `test/wiring.test.ts` が provider の構築オプションを捕まえ、`apiRoute`+`apiHandler` か `apiHandlers` かを問わず**設定されている全ハンドラ**に外された身元のリクエストを通して 401 を要求する。ルートが増えればそのルートも自動的に検査対象になる。
+- 順序のほうは `test/mcp.test.ts` の「the allowlist is evaluated before the scope check」で固定した。`scopes: []` かつ allowlist 外のトークンが 401 `invalid_token`（403 `insufficient_scope` ではない）を受け取ること、および同じ props で allowlist に載っていれば 403 が返ること（＝ scope チェックが生きていること）の両方を見る。
+
+**検証**: 上の 2 つの変異（ゲートを scope の後ろに移す／素の `mcpApiHandler` を配線する）を実際に当て、それぞれ対応するテストだけが落ちることを確認した。
+
+**ソース位置**: `mcp.ts` の `withAllowlistGate()` / `ApiHandler`、`index.ts` の `apiHandler`、`test/wiring.test.ts`
+
+### [15/レビュー] refresh_token 時の allowlist 照合（tokenExchangeCallback）を採らない
+
+**指摘**: `/mcp` のゲートが効いていても、外されたユーザーは `refresh_token` で新しい access token を発行し続けられる（grant の残り最長 30 日）。`tokenExchangeCallback` で `grantType === "refresh_token"` のときに allowlist を照合し `OAuthError` を投げれば、grant が能力として生きたままになるのを防げる。
+
+**軸** —— ①今ある不変条件に何を足すか ②既存の制約（リクエスト間の可変状態を持たない）の中で実装できるか ③設定ミスからの回復可能性 ④ポリシーの強制点が何箇所になるか。
+
+- ① ほぼ何も足さない。守りたいのは「外された身元はこのサーバーを使えない」で、`/mcp` の全リクエストが拒否される以上、refresh で得た access token で通せるリクエストはもう無い。増えるのは「grant を能力として早く畳む」ことだけで、それは判断2（revoke しない）で一度「毎リクエストで拒否している以上、得るものがほぼ無い」と評価した性質と同じもの。
+- ② 実装できない。`TokenExchangeCallbackOptions` が渡すのは `grantType` / `clientId` / `userId` / `grantId` / `scope` / `requestedScope` / `props` だけで、**`env` も `request` も無い**（dist の 3 箇所の呼び出しと .d.ts で確認）。provider は index.ts のモジュールスコープで 1 度だけ構築されるので、コールバックのクロージャからリクエストごとの `env.ALLOWED_GITHUB_USERS` は見えない。取る手は 2 つしかない —— (a) `fetch()` の中で env をモジュール変数に退避する（[09] と本項の「ホットパスのコスト」で 2 度却下した「リクエスト間で共有される可変状態」そのもの）、(b) provider をリクエストごとに構築し直す（全エンドポイントの配線をこの 1 件のために変える）。
+- ③ 悪化する。`/token` が `invalid_grant` を返すのは、クライアントにとって「この grant は死んだ、捨てて認可し直せ」の合図。フェイルクローズ（未設定＝全員拒否）と組み合わせると、secret を落としたデプロイが**全端末に grant を捨てさせる**ことを意味する。判断2 が軸②（誤りからの回復可能性）で避けたのはまさにこの不可逆性で、revoke ほど直接的でないだけで向きは同じ。
+- ④ 現在 2 箇所（`/callback` の入口、`/mcp` の毎リクエスト）で、どちらも同じ `isGitHubUserAllowed()` を通している。`/token` を足すと 3 箇所になり、フェイルクローズの扱いを揃え続ける面が増える。①がその対価をほぼゼロと評価している。
+
+**結論: 採らない**。②が単独でほぼ決定的（既存の制約を壊さずには書けない）で、書けるようにした版は③で判断2 が退けた不可逆性を持ち込む。①がその対価に見合うものを返さない。
+
+**受け入れたもの**: 外されたユーザーの grant は KV に最長 30 日残り、その間 refresh で access token を作れる。作れるだけで、`/mcp` はその token を全部拒否する。端末単位で即座に畳みたい場合の手段は従来どおり KV のキー削除（[09/複数端末] の kill switch 項）。
+
+### [15/レビュー] 拒否の理由はログでだけ分ける（応答は同一）
+
+**問題**: `ALLOWED_GITHUB_USERS` が未設定・空だと全員拒否になる（フェイルクローズ、意図どおり）。ただしチケット 15 以降、それは「新規の認可だけが止まる」ではなく「**稼働中の全マシンが即座に全停止**」を意味する。しかも `wrangler.jsonc` はこの名前を意図的に `vars` に出しておらず（`vars` に同名があるとデプロイのたびにシークレットを上書きするため）、起動時の検証も無い。secret を落としたデプロイは何のエラーも出さずに自分を締め出す。
+
+**対応**: ログ行に `reason` を足し、`allowlist_empty`（誰も載っていない ＝ 設定事故）と `identity_not_listed`（載っていない身元 ＝ 意図した除名）を区別する。
+
+**応答は区別しない**。「設定が空です」を応答に出すと、未認可の相手にサーバーの構成情報を渡すことになる。401 の本文・ヘッダー・ステータスは 2 つのケースで完全に同一で、テストがそれを固定している（`keeps the two refusals identical on the wire`。理由の文字列が応答のどこにも現れないことも見る）。
+
+**判定と理由付けを分けた**: `allowlistDenialReason()` はまず `isIdentityAllowed()` を呼び、**拒否が確定してから**理由を分類する。分類側に条件を書くと、判定と分類で許可集合がずれ得る（`/callback` と同じ関数を通す、という判断3 の意図が理由付けの側から崩れる）。
+
+**ソース位置**: `mcp.ts` の `AllowlistDenialReason` / `allowlistDenialReason()` / `withAllowlistGate()`、運用者向けの読み方は README の「運用者向けメモ」
+
+### [15/レビュー] provider の応答形を手で組み直している箇所の正本と drift 検出
+
+**問題**: `identityNotAllowedResponse()` は `resource_metadata` URL と `WWW-Authenticate` を、provider の `buildWwwAuthenticateHeader()` / `handleApiRequest()` とは別に組み立て直している。今はバイト単位で一致しているが、それを保証しているものが無く、ライブラリがヘッダ形式を変えれば黙って乖離する。乖離すると、provider の形しか解釈しないクライアントはこの 401 を「再認証せよ」と読まなくなる —— 判断1 の②がそこに乗っている。加えて、provider が `createErrorResponse()` で全エラー応答に付けている `NO_CACHE_HEADERS`（`Cache-Control: no-store` / `Pragma: no-cache`）が、こちらの 401 にも既存の `insufficientScopeResponse()` の 403 にも付いていなかった。
+
+**対応**:
+
+- 両方の応答に `NO_CACHE_HEADERS` を付けた。認証エラーは同じ URL への次のリクエストで結果が変わり得る（allowlist に書き戻した直後）ので、中間キャッシュに保持させない。
+- 正本がどれかをコメントで名指しした: `buildWwwAuthenticateHeader()`（ヘッダ本体）、`handleApiRequest()`（`resourceMetadataUrl` の組み立て）、`createErrorResponse()` + `NO_CACHE_HEADERS`（キャッシュ抑止と本文の形）。いずれも `@cloudflare/workers-oauth-provider` の `dist/oauth-provider.js`。
+- コメントだけでは気付けないので、`test/provider-response-shape.test.ts` が**実ライブラリ**を動かして突き合わせる。`OAuthProvider` に Authorization ヘッダ無しの `/mcp` リクエストを渡すと `handleApiRequest()` の 401 が出るので、その `WWW-Authenticate` のうち `error_description` の手前まで（スキーム・realm・`resource_metadata`・エラーコード）をこちらの 401 が前方一致で再現していること、no-cache ヘッダが一致すること、本文が同じ 2 フィールドであることを見る。設計上の差分（`error_description` の中身と末尾の `scope=`）はテストに明示してあるので、drift と区別できる。
+
+`test/oauth-grants.test.ts` と同じ狙い —— **ライブラリを上げるチケット 13 で効くテスト**。実 dist を node プールで動かすのに要る 2 点（`cloudflare:workers` の仮想モジュール差し替えと `server.deps.inline`）は vitest.config.ts に理由つきで書いてある。
+
+**ソース位置**: `mcp.ts` の `NO_CACHE_HEADERS` / `identityNotAllowedResponse()` / `insufficientScopeResponse()`、`test/provider-response-shape.test.ts`
 
 ---
 

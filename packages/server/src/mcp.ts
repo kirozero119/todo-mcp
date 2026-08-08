@@ -15,7 +15,11 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { createTaskDb, type TaskDb, type Workspace } from "@todo-mcp/core";
 import { z } from "zod";
 
-import { githubNumericIdFromUserId, isGitHubUserAllowed } from "./allowlist";
+import {
+  githubNumericIdFromUserId,
+  isGitHubUserAllowed,
+  parseAllowedGitHubUsers,
+} from "./allowlist";
 import { MCP_ROUTE, SCOPES_SUPPORTED, SERVER_NAME, SERVER_VERSION } from "./config";
 import { registerTodoTools } from "./todo-tools";
 import { tursoConfigFromEnv } from "./turso";
@@ -147,6 +151,24 @@ function hasRequiredScope(props: Partial<Props> | undefined): boolean {
   return Array.isArray(props?.scopes) && props.scopes.includes(REQUIRED_SCOPE);
 }
 
+/**
+ * [provider response shape] provider の `createErrorResponse()` が**すべての**
+ * エラー応答に付けている `NO_CACHE_HEADERS` の写し。
+ *
+ * 正本は `@cloudflare/workers-oauth-provider` の `NO_CACHE_HEADERS`
+ * （dist/oauth-provider.js。`createErrorResponse()` が
+ * `{ ...NO_CACHE_HEADERS, ...options.headers }` として展開する）。認証エラーの
+ * 応答をキャッシュさせないのは、同じ URL への次のリクエストが別の判定結果に
+ * なる（allowlist に書き戻した直後など）ため。この定数と下の 2 つの応答が
+ * provider の形から逸れていないことは `test/provider-response-shape.test.ts`
+ * が実ライブラリと突き合わせて検査する —— ライブラリを上げるチケット 13 では、
+ * そのテストが落ちたらここの差分を取り直す。
+ */
+const NO_CACHE_HEADERS = {
+  "Cache-Control": "no-store",
+  Pragma: "no-cache",
+} as const;
+
 function insufficientScopeResponse(): Response {
   return new Response(
     JSON.stringify({
@@ -157,6 +179,7 @@ function insufficientScopeResponse(): Response {
       status: 403,
       headers: {
         "Content-Type": "application/json",
+        ...NO_CACHE_HEADERS,
         "WWW-Authenticate": `Bearer error="insufficient_scope", scope="${SCOPES_SUPPORTED.join(" ")}"`,
       },
     },
@@ -181,14 +204,58 @@ function isIdentityAllowed(props: Partial<Props> | undefined, env: Partial<Env>)
 }
 
 /**
+ * [15/allowlist diagnosability] 拒否の理由。**ログにだけ**出す。
+ *
+ * `allowlist_empty` は `ALLOWED_GITHUB_USERS` が未設定・空・区切り文字だけ
+ * （＝誰も載っていない）、`identity_not_listed` は allowlist はあるがこの身元が
+ * 載っていない。この 2 つは運用上まったく違う事故（secret を落としたデプロイ vs
+ * 意図した除名）なのに、前者は「稼働中の全マシンが即座に全停止」を意味する。
+ * 応答からは区別できないので（下記）、ログで区別できないと切り分ける手段が無い。
+ */
+type AllowlistDenialReason = "allowlist_empty" | "identity_not_listed";
+
+/**
+ * 許可なら `undefined`、拒否ならその理由。
+ *
+ * 許可・拒否の**判定そのもの**は `isIdentityAllowed()` 一本のまま。理由付けは
+ * 判定が拒否に倒れた後の後付け分類にとどめる —— 分類側に条件を足すと、判定と
+ * 分類で許可集合がずれ得る。
+ */
+function allowlistDenialReason(
+  props: Partial<Props> | undefined,
+  env: Partial<Env>,
+): AllowlistDenialReason | undefined {
+  if (isIdentityAllowed(props, env)) return undefined;
+  return parseAllowedGitHubUsers(env.ALLOWED_GITHUB_USERS).length === 0
+    ? "allowlist_empty"
+    : "identity_not_listed";
+}
+
+/**
  * [15/allowlist per request] 拒否は 403 ではなく 401 `invalid_token`。
  *
  * ヘッダーは provider 自身の 401（`buildWwwAuthenticateHeader` /
- * `handleApiRequest`）と同じ形にする —— `resource_metadata` があることで、
- * MCP クライアントはこの 401 を「再認証せよ」と読める。再認証は `GET /callback`
- * の allowlist に当たって `access_denied` になるので、「もう許可されていない」が
- * ブラウザ上で人間に見える。`scope=` を足すのは index.ts の `onError()`
- * ([M-2/P1-3]) と同じ理由・同じ形にするため。詳細は docs/design-notes.md 参照。
+ * `handleApiRequest`）と同じ形にする —— `resource_metadata` があることで、MCP の
+ * Authorization 仕様に従うクライアントはこの 401 を「再認証せよ」と読む。その
+ * 再認証は `GET /callback` の allowlist に当たって `access_denied` になるので、
+ * 「もう許可されていない」がブラウザ上で人間に見える。**401 を受けた実際の
+ * クライアントが何をするかはクライアント側の実装**で、ここからは強制できない
+ * （未検証。docs/design-notes.md の [15] 判断1）。`scope=` を足すのは index.ts の
+ * `onError()`（[M-2/P1-3]）と同じ理由・同じ形にするため。
+ *
+ * [provider response shape] `WWW-Authenticate` の正本は provider の
+ * `buildWwwAuthenticateHeader(resourceMetadataUrl, error, errorDescription)`、
+ * `resourceMetadataUrl` の組み立てと `NO_CACHE_HEADERS` の正本は
+ * `handleApiRequest()` / `createErrorResponse()`（いずれも
+ * @cloudflare/workers-oauth-provider の dist/oauth-provider.js）。ここは
+ * その出力を手で組み直しているので、ライブラリ側が形を変えると黙って乖離する。
+ * `test/provider-response-shape.test.ts` が実ライブラリの 401 と突き合わせて
+ * いるので、チケット 13 のバージョン上げでそこが落ちたらこの関数を直す。
+ *
+ * [15/allowlist diagnosability] 拒否の理由（allowlist_empty /
+ * identity_not_listed）は**この応答に載せない**。載せるとサーバーの構成情報
+ * （secret が落ちているかどうか）を未認可の相手に渡すことになる。区別はログ側
+ * だけで行う。
  */
 function identityNotAllowedResponse(request: Request): Response {
   const url = new URL(request.url);
@@ -199,6 +266,7 @@ function identityNotAllowedResponse(request: Request): Response {
     status: 401,
     headers: {
       "Content-Type": "application/json",
+      ...NO_CACHE_HEADERS,
       "WWW-Authenticate":
         `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", ` +
         `error="invalid_token", error_description="${description}", ` +
@@ -229,6 +297,58 @@ function tursoOpener(env: Partial<Env>): () => TaskDb {
 }
 
 /**
+ * OAuthProvider の `apiHandler` / `apiHandlers` に渡せる最小の形。
+ *
+ * provider 側の `ExportedHandlerWithFetch<Env>` のうち、この Worker が実際に
+ * 使う面だけを写したもの。`withAllowlistGate()` の入出力を同じ型にして、
+ * ゲートを何段でも噛ませられる（＝配線側で外し忘れが型に出る）ようにする。
+ */
+export interface ApiHandler {
+  fetch: (request: Request, env: unknown, ctx: ExecutionContext) => Promise<Response>;
+}
+
+/**
+ * [15/allowlist per request] 認証済みルートに allowlist ゲートを掛ける。
+ *
+ * **配線の性質としてのゲート**。判定を `mcpApiHandler` の本文に置くと、
+ * 「認証済みの全ルートが allowlist を再評価する」という不変条件が、その 1 関数の
+ * 中身だけで担保されることになる。provider は `apiHandlers`（route → handler の
+ * マップ）も受け付けるので、将来 2 本目のルートを足した人は、そのルートに
+ * ゲートを掛けたつもりが無いまま `/mcp` と同じトークンで通せるハンドラを
+ * 公開できてしまう。ラッパーにしておけば、provider に渡すものを書く時点で
+ * 「ゲートを掛ける／掛けない」を明示的に選ぶことになる。
+ * 配線が実際にゲート済みであることは `test/wiring.test.ts` が index.ts の
+ * provider 設定を読んで検査する（ルートが増えてもその全部を検査する）。
+ *
+ * **順序**: このラッパーは中のハンドラより必ず先に走るので、allowlist は
+ * scope チェック（`mcpApiHandler` の中）より先に評価される。これは
+ * 「もうこのサーバーを使えない身元に scope の不足を案内しても、実行できる
+ * 回復手順にならない」ため（詳細は docs/design-notes.md の [15]）。
+ * 順序が逆になると、scope 無しかつ allowlist から外れたトークンが
+ * `403 insufficient_scope` を受け取り、「もっと広い権限を取り直せば通る」という
+ * 嘘の含意になる —— そこを固定しているのが test/mcp.test.ts の
+ * 「refuses before the scope check」テスト。
+ */
+export const withAllowlistGate = (handler: ApiHandler): ApiHandler => ({
+  fetch: (request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> => {
+    const props = (ctx as ExecutionContext & { props?: Partial<Props> }).props;
+    const denialReason = allowlistDenialReason(props, (env ?? {}) as Partial<Env>);
+    if (denialReason) {
+      console.log(
+        `[mcp] ${JSON.stringify({
+          event: "identity_not_allowed",
+          reason: denialReason,
+          login: props?.login ?? null,
+          user_id: props?.user_id ?? null,
+        })}`,
+      );
+      return Promise.resolve(identityNotAllowedResponse(request));
+    }
+    return handler.fetch(request, env, ctx);
+  },
+});
+
+/**
  * ExportedHandler 形状でラップ: OAuthProvider の apiHandler は
  * `fetch(request, env, ctx)` を期待するが、createMcpHandler が返すのは
  * `fetch(request, options)`。スコープ強制の場所でもある（詳細は
@@ -238,27 +358,16 @@ function tursoOpener(env: Partial<Env>): () => TaskDb {
  * （createTodoMcpServer の doc コメント参照）。組み立てるのは薄いラッパーで、
  * McpServer 自体は元々リクエストごとに作られる（stateless 設計）。
  *
- * [15/allowlist per request] allowlist の照合もここで行う。tools / resources /
- * prompts / initialize はすべて同じ `/mcp` の POST なので、この 1 箇所が
- * 全経路のゲートになる。
+ * [15/allowlist per request] allowlist の照合はここには**無い**。
+ * `withAllowlistGate()` が外側に掛かる（index.ts の配線）。tools / resources /
+ * prompts / initialize、さらに非 POST（GET / DELETE）も JSON-RPC バッチも
+ * すべて同じ `/mcp` に来るので、そのラッパー 1 枚が全経路のゲートになる。
  */
-export const mcpApiHandler = {
+export const mcpApiHandler: ApiHandler = {
   fetch: (request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> => {
     const props = (ctx as ExecutionContext & { props?: Partial<Props> }).props;
     const workerEnv = (env ?? {}) as Partial<Env>;
 
-    // [15/allowlist per request] scope より先に見る。もうこのサーバーを使えない
-    // 身元に scope の不足を案内しても、実行できる回復手順にならないため。
-    if (!isIdentityAllowed(props, workerEnv)) {
-      console.log(
-        `[mcp] ${JSON.stringify({
-          event: "identity_not_allowed",
-          login: props?.login ?? null,
-          user_id: props?.user_id ?? null,
-        })}`,
-      );
-      return Promise.resolve(identityNotAllowedResponse(request));
-    }
     if (!hasRequiredScope(props)) return Promise.resolve(insufficientScopeResponse());
 
     const handler = createMcpHandler(createTodoMcpServer({ openDb: tursoOpener(workerEnv) }), {

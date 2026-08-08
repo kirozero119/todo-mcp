@@ -4,7 +4,7 @@
  * 構成:
  *   Origin ガード -> /mcp のみ、他の何よりも先に実行（下記参照）
  *   OAuthProvider -> /authorize（パース）、/token、/register、/.well-known/*
- *     apiRoute /mcp     -> mcpApiHandler（有効なトークンがある場合のみ）
+ *     apiRoute /mcp     -> withAllowlistGate(mcpApiHandler)（有効なトークンがある場合のみ）
  *     defaultHandler    -> GitHubHandler（同意画面、GitHub リダイレクト、コールバック）
  */
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
@@ -13,13 +13,18 @@ import { localhostAllowedOrigins, originValidationResponse } from "@modelcontext
 import { isLoopbackRedirectUri } from "./approval";
 import { MCP_ROUTE, SCOPES_SUPPORTED, SERVER_NAME } from "./config";
 import { GitHubHandler } from "./github-handler";
-import { mcpApiHandler } from "./mcp";
+import { mcpApiHandler, withAllowlistGate } from "./mcp";
 import { isAllowedRegistrationRedirectUri } from "./redirect-uri";
 import type { Env } from "./types";
 
 const provider = new OAuthProvider<Env>({
   apiRoute: MCP_ROUTE,
-  apiHandler: mcpApiHandler,
+  // [15/allowlist per request] 認証済みルートに渡すハンドラは必ず
+  // `withAllowlistGate()` をくぐらせる。ここに素の handler を書くと、
+  // 発行済みトークンが allowlist の変更を無視して通る。ルートを足すときも
+  // 同じ —— `apiHandlers: { "/mcp": withAllowlistGate(a), "/x": withAllowlistGate(b) }`。
+  // 配線がゲート済みかどうかは test/wiring.test.ts が provider 設定を読んで検査する。
+  apiHandler: withAllowlistGate(mcpApiHandler),
   defaultHandler: {
     fetch: (request: Request, env: Env, ctx: ExecutionContext) =>
       GitHubHandler.fetch(request, env, ctx),
