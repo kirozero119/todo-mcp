@@ -4,6 +4,7 @@ import type { TaskDb } from "../src/db";
 import {
   completeTask,
   createTask,
+  deleteTask,
   getTask,
   importTask,
   listOpenTaskIds,
@@ -356,6 +357,37 @@ describe("status 遷移と closed_at", () => {
 
     const open = await listOpenTasks(db, { userId: ME, workspace: "life" });
     expect(open.map((task) => task.title)).toEqual(["someday のもの"]);
+  });
+});
+
+describe("物理削除", () => {
+  it("同じ user_id の行だけを削除し、削除した内容を返す", async () => {
+    const mine = await seed({ title: "消す" });
+    await createTask(db, {
+      userId: SOMEONE_ELSE,
+      workspace: "life",
+      title: "他人のタスク",
+      now: T0,
+    });
+
+    const deleted = await deleteTask(db, { userId: ME, id: mine.id });
+
+    expect(deleted?.title).toBe("消す");
+    expect(await getTask(db, { userId: ME, id: mine.id })).toBeNull();
+    expect(await getTask(db, { userId: SOMEONE_ELSE, id: mine.id + 1 })).not.toBeNull();
+  });
+
+  it("他人の id と存在しない id は null", async () => {
+    const other = await createTask(db, {
+      userId: SOMEONE_ELSE,
+      workspace: "life",
+      title: "他人のタスク",
+      now: T0,
+    });
+
+    expect(await deleteTask(db, { userId: ME, id: other.id })).toBeNull();
+    expect(await deleteTask(db, { userId: ME, id: 9999 })).toBeNull();
+    expect(await getTask(db, { userId: SOMEONE_ELSE, id: other.id })).not.toBeNull();
   });
 });
 

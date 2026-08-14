@@ -31,7 +31,7 @@
  * 同じ判定は `packages/core/test/invariants.test.ts` が毎回実行している
  * （そちらはコメントを落としてから見るので、doc コメント中の `TaskDb` には反応しない）。
  */
-import type { TaskDb } from "./db";
+import type { TaskDb } from "./db.ts";
 import {
   isClosedStatus,
   OPEN_STATUSES,
@@ -40,8 +40,8 @@ import {
   type Task,
   type TaskField,
   type Workspace,
-} from "./schema";
-import { nowIso } from "./time";
+} from "./schema.ts";
+import { nowIso } from "./time.ts";
 
 /** SELECT / RETURNING で取り出す列。user_id を含めない理由は schema.ts の Task を参照。 */
 const TASK_COLUMNS =
@@ -366,6 +366,26 @@ export async function completeTask(
   const current = await getTask(db, { userId: params.userId, id: params.id });
   if (!current) return null;
   return { task: current, outcome: current.status === "done" ? "already_done" : "reopened" };
+}
+
+/**
+ * 1 件を物理削除する。日常の「やめる」は status=cancelled で表し、この関数は
+ * 管理用 CLI だけが使う。MCP サーバーにはこの操作を公開しない。
+ *
+ * DELETE 自体にも user_id を含め、他人の行は「存在しない」として null を返す。
+ * 事前 SELECT → DELETE にしないのは、その 2 文の間に対象が変わる余地を作らず、
+ * 実際に消した行を RETURNING でそのまま返すため。
+ */
+export async function deleteTask(
+  db: TaskDb,
+  params: UserScope & { id: number },
+): Promise<Task | null> {
+  const rows = await db.all(
+    `DELETE FROM tasks WHERE user_id = ? AND id = ? RETURNING ${TASK_COLUMNS}`,
+    [params.userId, params.id],
+  );
+  const row = rows[0];
+  return row ? taskFromRow(row) : null;
 }
 
 export interface SearchTasksParams extends UserScope {

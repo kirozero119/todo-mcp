@@ -999,6 +999,41 @@ $ grep -n 'import .*TaskDb' packages/migrate/src/legacy.ts
 - **`due_time_dropped` は 8 件では発火しない**。該当の #91 / #92 はどちらも done。
 - **`empty_to_null` も 8 件では発火しない**（旧 DB に空文字が 0 件）。防御が生きていることはテストでのみ固定されている。
 
+## [11] TypeScript CLI
+
+### 5 コマンドを維持し、MCP ツールの形をコピーしない
+
+**判断**: CLI の interface は旧 Python 版の `add / list / status / edit / delete` を維持した。
+MCP の `get_agenda / get_task / upsert_task / complete_task / search_tasks` をそのままサブコマンドへ
+写す案は採らない。MCP はモデルが選ぶ中間表現、CLI は人間が短く打つ interface で、読み手が違う。
+同一にすべきなのは workspace / status / Task 型 / SQL / 時刻であり、それらだけを core で共有する。
+
+`category` はドメイン上 `project` に改名済みだが、旧コマンドの使用感を壊さないため
+`--category` を `--project` の互換名として受ける。作成日時の手入力 `--created-at` は廃止した。
+新システムでは created_at / updated_at / closed_at の整合を core が持つため、CLI だけに過去時刻を
+書ける入口を残すと共有した不変条件が崩れる。
+
+### 身元は端末設定、workspace は端末既定 + コマンド上書き
+
+CLI は OAuth サーバーを経由せず Turso へ直接接続するため、`TODO_USER_ID` が認証コンテキストの代わりになる。
+これを毎回の `--user-id` にせず環境設定だけにした。タイプミスがそのまま「誰にも見えない別スコープ」への
+書き込みになる値を、日常の interface に載せないため。workspace は 3 台で実際に変わるので
+`TODO_WORKSPACE` を端末既定にし、`--workspace` が来たときだけ上書きする。
+
+### 物理削除も user_id スコープを core で強制する
+
+物理削除は MCP に公開せず CLI の `delete` にだけ置くが、生 SQL は CLI に書かない。
+core の `deleteTask()` が `DELETE ... WHERE user_id = ? AND id = ? RETURNING ...` を 1 文で実行し、
+他人の id と存在しない id を同じ null として返す。これにより「TaskDb に対する SQL は tasks.ts だけ」
+という 09 の機械検査可能な性質を保ち、CLI 側の実装は削除結果の表示だけになる。
+
+### Node が TypeScript を直接実行する
+
+CLI は Node >=22.18 の型除去を使い、追加ランタイムやビルド成果物を要求しない。パッケージの `bin` は
+`src/main.ts` を直接指す。そのため core の実行時 relative import だけは `.ts` 拡張子を明示し、各 package の
+typecheck で `allowImportingTsExtensions` を有効にした。Wrangler / Vitest の既存経路も含めた全 workspace の
+typecheck とテストで非退行を固定する。
+
 ---
 
 ## todo-tools.ts / todo-format.ts

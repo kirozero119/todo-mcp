@@ -4,15 +4,15 @@
     "module": "es2022",
     "moduleResolution": "bundler",
     "lib": ["es2022"],
-    "types": ["@cloudflare/workers-types"],
+    "types": ["node"],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "isolatedModules": true,
     "verbatimModuleSyntax": true,
-    "allowImportingTsExtensions": true,
     "noUncheckedIndexedAccess": true,
-    "esModuleInterop": true
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "isolatedModules": true
   },
   "include": ["src", "test", "vitest.config.ts"]
 }

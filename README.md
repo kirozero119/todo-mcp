@@ -2,9 +2,9 @@
 
 実用的な Todo MCP サーバー。Turso + GitHub OAuth + ワークスペース切り替え。MCP spec 2026-07-28 / SDK v2 上に構築。
 
-現在の状態: **認証つきサーバー + Todo ツール本実装 + 旧 DB からの移行スクリプト**。ツールセット v1
-（5 ツール + Resource / Prompt 各 1）が Turso 上で動き、旧 `todos.db` の中身を `packages/migrate`
-で移せる。`packages/cli` は後続チケット。
+現在の状態: **認証つきサーバー + Todo ツール本実装 + TypeScript CLI + 旧 DB からの移行スクリプト**。
+ツールセット v1（5 ツール + Resource / Prompt 各 1）と人間向け `todo` コマンドが同じ core を使い、
+Turso 上の同じタスクを扱う。
 
 ## 構成
 
@@ -12,7 +12,7 @@
 packages/core/       MCP サーバーと CLI で共有するドメイン層（Cloudflare 非依存）
   schema.sql         tasks テーブルの確定 DDL（Turso への適用元）
   src/schema.ts      workspace / status の Zod enum、Task 型、行マッパー
-  src/tasks.ts       tasks への SQL 全部（list / get / create / update / complete / search）
+  src/tasks.ts       tasks への SQL 全部（list / get / create / update / complete / search / delete）
   src/db.ts          Turso クライアント生成と、クエリが要求する最小の DB 面（TaskDb）
   src/time.ts        保存フォーマット（ISO 8601 UTC）と「今日」の JST 境界
 
@@ -35,9 +35,16 @@ packages/migrate/    旧 Python CLI の todos.db → Turso の 1 回きりの移
   src/execute.ts     書き込みの順番（カウンタ先行 → INSERT → 再アサート → 読み直し）
   src/verify.ts      投入後の値レベル検証（書いたはずの値と DB の実際を全列で突き合わせる）
   src/sequence.ts    sqlite_sequence の引き上げ（tasks 以外を触る唯一の生 SQL）
+
+packages/cli/        人間が端末から直接使う `todo` コマンド（Node >=22.18）
+  src/args.ts        5 コマンドの引数と検証（純粋関数）
+  src/config.ts      TODO_* 環境変数から接続・身元・端末既定 workspace を解決
+  src/commands.ts    core を呼ぶ実行層（表示は文字列配列で返す）
+  src/format.ts      人間向けの一覧・結果表示
+  src/main.ts        argv / env / stdout にだけ触る薄い I/O シェル
 ```
 
-npm workspaces のモノレポ構成。`packages/cli` は後日追加予定。
+npm workspaces のモノレポ構成。
 
 ## ツール
 
@@ -54,6 +61,50 @@ npm workspaces のモノレポ構成。`packages/cli` は後日追加予定。
 
 workspace はマシンごとの既定を接続 URL の `?workspace=work|life` で決め、ツール引数が来たら
 そちらが勝つ。タスクは GitHub アイデンティティ（`github:<数値id>`）ごとに完全に分離される。
+
+## CLI
+
+旧 Python CLI と同じ 5 サブコマンドを保ち、フィールド名だけ新ドメインへ合わせている。
+`--category` は既存の呼び出しを壊さないため `--project` の互換名として受け付ける。
+
+```bash
+todo add "資料作成" --project PKSHA --due 2026-08-20
+todo list
+todo list --workspace work --status waiting
+todo status 153 done
+todo edit 149 --clear-due --memo "日程未定"
+todo delete 12
+```
+
+- `add` / `list` は `--workspace` を省略すると、その端末の `TODO_WORKSPACE` を使う。
+- status は `todo / in_progress / waiting / someday / done / cancelled` の 6 値。
+- `edit` の `--clear-project / --clear-due / --clear-memo` は値を `null` に戻す。
+- `delete` は物理削除。日常の「やめる」は `todo status <id> cancelled` を使う。
+- `--created-at` は廃止。作成・更新・完了時刻は core が現在時刻から一貫して付ける。
+
+### 端末セットアップ
+
+Node 22.18 以降でリポジトリを clone し、依存を入れて `todo` をリンクする。
+
+```bash
+npm install
+cd packages/cli
+npm link
+cd ../..
+```
+
+各端末に次の 4 変数を設定する。DB URL / token は Workers の本番設定と同じ Turso DB を向ける。
+`TODO_USER_ID` は OAuth の props と同じ `github:<数値id>`、`TODO_WORKSPACE` は端末ごとの既定レンズ。
+
+```bash
+export TODO_DATABASE_URL='libsql://todo-mcp-prod-<org>.<region>.turso.io'
+export TODO_AUTH_TOKEN='<Turso token>'
+export TODO_USER_ID='github:<numeric id>'
+export TODO_WORKSPACE='life' # 会社 PC は work、私物端末は life
+```
+
+資格情報をリポジトリ内のファイルへ置かない。設定後は `todo list` で読み取り確認してから、
+`todo add` などの書き込みを行う。リンク前でもリポジトリ内から `npm run cli -- list` で確認できる。
 
 ## Turso
 
