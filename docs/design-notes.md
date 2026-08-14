@@ -298,9 +298,19 @@
 
 **問題**: 「認可が拒否されて grant が一切作られずに終わる」経路が2つある。①このサーバー自身の allowlist が GitHub アイデンティティを拒否する場合、②GitHub 自体が upstream の認可を拒否する場合（ユーザーが GitHub 側の同意画面で Cancel を押した、GitHub App が suspend されている等）。どちらも素の 403 やエラーステータスをクライアントに返すと、クライアント側に解釈する標準的な手段がない。
 
-**対応**: 両方の経路を `respondAccessDenied()` に共通化し、RFC 6749 §4.1.2.1 に従って、クライアントの検証済み redirect_uri へ `error=access_denied`（と、あれば元の `state`）を付けてリダイレクトで返す。
+**対応**: 両方の経路を `respondAccessDenied()` に共通化し、RFC 6749 §4.1.2.1 に従って、クライアントの検証済み redirect_uri へ `error=access_denied`（と、あれば元の `state`）を付けてリダイレクトで返す。RFC 9207 の `iss` も認可サーバー自身の origin から導出して付ける。
 
 **ソース位置**: `github-handler.ts` の `respondAccessDenied()`（呼び出し元: `GET /callback` の allowlist 拒否と GitHub-side denial）
+
+### [Codex / RFC 9207] 認可レスポンスの issuer をコールバック origin から固定する
+
+**問題**: Codex CLI は認可サーバーメタデータの `authorization_response_iss_parameter_supported: true` に従い、ループバック callback に戻る成功・拒否レスポンスの `iss` を検証する。`workers-oauth-provider` の `completeAuthorization()` は `request.issuer` が無ければ `iss` を省略するため、永続化した認可リクエストの形や拒否経路によっては Codex が `Authorization server response missing required issuer` で停止する。
+
+**対応**: `/callback` と `POST /authorize` を処理している現在のリクエスト origin を認可サーバー issuer の正本とし、成功時は `completeAuthorization()` の `request.issuer` を明示的に上書き、拒否時は `respondAccessDenied()` が同じ値を付ける。保存済み state に入っている issuer は信用しないため、外部入力で `iss` を差し替えることもできない。
+
+**検証**: `github-handler.test.ts` で成功・3種類の拒否が `iss` を持つことと、保存済み state の issuer を現在 origin で上書きすることを確認する。`oauth-grants.test.ts` では実物の provider を通した CIMD / DCR の最終 `Location` にも `iss` が入ることを確認する。
+
+**ソース位置**: `github-handler.ts` の `respondAccessDenied()` と `GET /callback` の `completeAuthorization()` 呼び出し。
 
 ### registrationSource() の判定は provider の isClientMetadataUrl() を踏襲
 

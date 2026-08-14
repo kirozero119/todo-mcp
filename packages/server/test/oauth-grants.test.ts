@@ -226,6 +226,9 @@ describe("[09/複数端末] 実ライブラリに対する grant の共存", () 
 
     const response = await authorizeOneMachine(CIMD_CLIENT_ID, store, provider);
     expect(response.status).toBe(302);
+    expect(new URL(response.headers.get("Location")!).searchParams.get("iss")).toBe(
+      "http://localhost:8788",
+    );
 
     // 1) 認可コードは provider のトークン形式 `userId:grantId:secret`。
     const code = new URL(response.headers.get("Location")!).searchParams.get("code")!;
@@ -307,6 +310,9 @@ describe("[09/複数端末] 実ライブラリに対する grant の共存", () 
       for (let machine = 0; machine < 3; machine++) {
         const response = await authorizeOneMachine(clientId, store, provider);
         expect(response.status).toBe(302);
+        expect(new URL(response.headers.get("Location")!).searchParams.get("iss")).toBe(
+          "http://localhost:8788",
+        );
       }
 
       expect(store.grantKeys()).toHaveLength(1);

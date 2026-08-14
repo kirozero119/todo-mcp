@@ -87,11 +87,13 @@ function redirectToGitHub(
  */
 function respondAccessDenied(
   oauthReqInfo: AuthRequest,
+  issuer: string,
   clearSessionCookie: string | undefined,
 ): Response {
   const denied = new URL(oauthReqInfo.redirectUri);
   denied.searchParams.set("error", "access_denied");
   if (oauthReqInfo.state) denied.searchParams.set("state", oauthReqInfo.state);
+  denied.searchParams.set("iss", issuer);
   const headers = new Headers({ Location: denied.toString() });
   if (clearSessionCookie) headers.set("Set-Cookie", clearSessionCookie);
   return new Response(null, { status: 302, headers });
@@ -252,7 +254,7 @@ app.post("/authorize", async (c) => {
     if (formData.get("decision") === "deny") {
       const oauthReqInfo = await rejectOAuthState(stateToken, c.env.OAUTH_KV);
       log("authorize_user_denied", { client_id: oauthReqInfo.clientId });
-      return respondAccessDenied(oauthReqInfo, clearCsrfCookie);
+      return respondAccessDenied(oauthReqInfo, new URL(c.req.raw.url).origin, clearCsrfCookie);
     }
 
     // [M-1/P1-1 + state ownership] approveOAuthState() は不透明トークンだけで
@@ -309,7 +311,11 @@ app.get("/callback", async (c) => {
         reason: upstreamError,
         client_id: oauthReqInfo.clientId,
       });
-      return respondAccessDenied(oauthReqInfo, clearSessionCookie);
+      return respondAccessDenied(
+        oauthReqInfo,
+        new URL(c.req.raw.url).origin,
+        clearSessionCookie,
+      );
     }
 
     if (!oauthReqInfo.clientId) return c.text("不正な OAuth リクエストデータです", 400);
@@ -340,13 +346,22 @@ app.get("/callback", async (c) => {
         client_id: oauthReqInfo.clientId,
       });
       // [L-13] RFC 6749 §4.1.2.1 に従いリダイレクトで拒否を返す。
-      return respondAccessDenied(oauthReqInfo, clearSessionCookie);
+      return respondAccessDenied(
+        oauthReqInfo,
+        new URL(c.req.raw.url).origin,
+        clearSessionCookie,
+      );
     }
 
     // [P1-2/L-7] `resource` を省略するクライアントには裸のオリジンを補完し、
     // audience 未設定のトークンを発行しないようにする（index.ts の
     // resourceMatchOriginOnly と対。詳細は docs/design-notes.md 参照）。
     const resource = oauthReqInfo.resource ?? new URL(c.req.raw.url).origin;
+    // [Codex / RFC 9207] 認可レスポンスの `iss` はクライアント由来の state では
+    // なく、このコールバックを処理している認可サーバー自身の origin で固定する。
+    // provider は request.issuer が無い場合 `iss` を省略するため、DCR/Codex を
+    // 含む全経路で明示的に保証する。
+    const issuer = new URL(c.req.raw.url).origin;
 
     // [scope enforcement] grant の scope と props.scopes に一度だけ計算した
     // 値を使い回す。強制ロジック本体は mcp.ts の hasRequiredScope()。
@@ -370,7 +385,7 @@ app.get("/callback", async (c) => {
       registration === "cimd" ? ({ revokeExistingGrants: false } as const) : {};
 
     const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
-      request: { ...oauthReqInfo, resource },
+      request: { ...oauthReqInfo, resource, issuer },
       // コロンなし: provider のトークン形式は `userId:grantId:secret` で
       // ちょうど3パーツを要求する（詳細は allowlist.ts の設計ノート参照）。
       userId: githubGrantUserId(identity.id),

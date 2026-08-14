@@ -368,6 +368,7 @@ describe("POST /authorize", () => {
     expect(location.startsWith(BASE_AUTH_REQUEST.redirectUri)).toBe(true);
     expect(new URL(location).searchParams.get("error")).toBe("access_denied");
     expect(new URL(location).searchParams.get("state")).toBe(BASE_AUTH_REQUEST.state);
+    expect(new URL(location).searchParams.get("iss")).toBe("http://localhost:8788");
 
     const cookies = getSetCookies(denyResponse);
     expect(cookies.some((c) => c.startsWith("__Host-APPROVED_CLIENTS="))).toBe(false);
@@ -416,6 +417,7 @@ describe("GET /callback", () => {
     expect(location.startsWith(BASE_AUTH_REQUEST.redirectUri)).toBe(true);
     expect(new URL(location).searchParams.get("error")).toBe("access_denied");
     expect(new URL(location).searchParams.get("state")).toBe(BASE_AUTH_REQUEST.state);
+    expect(new URL(location).searchParams.get("iss")).toBe("http://localhost:8788");
     expect(completeAuthorization).not.toHaveBeenCalled();
   });
 
@@ -456,6 +458,7 @@ describe("GET /callback", () => {
     expect(location.startsWith(BASE_AUTH_REQUEST.redirectUri)).toBe(true);
     expect(new URL(location).searchParams.get("error")).toBe("access_denied");
     expect(new URL(location).searchParams.get("state")).toBe(BASE_AUTH_REQUEST.state);
+    expect(new URL(location).searchParams.get("iss")).toBe("http://localhost:8788");
     expect(completeAuthorization).not.toHaveBeenCalled();
   });
 
@@ -463,7 +466,10 @@ describe("GET /callback", () => {
     stubGitHubFetch({ login: "octocat", id: 1 });
 
     const kv = kvStub();
-    const { stateToken } = await createOAuthState(BASE_AUTH_REQUEST, kv);
+    const { stateToken } = await createOAuthState(
+      { ...BASE_AUTH_REQUEST, issuer: "https://untrusted.example" },
+      kv,
+    );
     await approveOAuthState(stateToken, kv);
     const { setCookie } = await bindStateToSession(stateToken);
     const sessionCookiePair = setCookie.split(";")[0]!;
@@ -492,6 +498,9 @@ describe("GET /callback", () => {
     // an RFC 8707 `resource` parameter.
     const call = completeAuthorization.mock.calls[0]?.[0];
     expect(call?.request.resource).toBe("http://localhost:8788");
+    // RFC 9207 の issuer は保存済み state の値を信用せず、現在の認可
+    // サーバー origin から必ず再導出する。
+    expect(call?.request.issuer).toBe("http://localhost:8788");
     // [redesign 6] props.scopes carries the same granted scopes as the
     // grant's own `scope` — this is what mcp.ts's apiHandler checks before
     // any tool call is reached. BASE_AUTH_REQUEST.scope is `[]`, so
