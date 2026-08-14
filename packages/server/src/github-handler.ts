@@ -9,6 +9,7 @@
  * ドキュメントを担う。このファイルは人間の目に触れる部分（同意画面、GitHub への
  * リダイレクト、認可を完了させるか決めるコールバック）をすべて担う。
  */
+import { CimdFetchError } from "@cloudflare/workers-oauth-provider";
 import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
 import { Hono } from "hono";
 
@@ -109,29 +110,34 @@ app.get("/authorize", async (c) => {
       // クライアントが接続できないときに最も役立つログ行: redirect_uri/ポート
       // 不一致か、未知クライアントか、PKCE メソッド拒否かを切り分けられる。
       const url = new URL(c.req.url);
+      const cimdFailure = error instanceof CimdFetchError;
       log("authorize_rejected", {
         client_id: url.searchParams.get("client_id"),
         registration: registrationSource(url.searchParams.get("client_id") ?? ""),
         requested_redirect_uri: url.searchParams.get("redirect_uri"),
         code_challenge_method: url.searchParams.get("code_challenge_method"),
-        reason: error instanceof Error ? error.message : String(error),
+        reason: cimdFailure
+          ? "cimd_fetch_failed"
+          : error instanceof Error
+            ? error.message
+            : String(error),
+        ...(cimdFailure ? { cimd_url: error.metadataUrl, detail: error.detail } : {}),
       });
+      const publicReason = cimdFailure
+        ? "クライアント情報を取得できません"
+        : error instanceof Error
+          ? error.message
+          : "不明なエラー";
       return c.text(
-        `不正な認可リクエストです: ${error instanceof Error ? error.message : "不明なエラー"}`,
+        `不正な認可リクエストです: ${publicReason}`,
         400,
       );
     }
 
-    // [M-1/P1-1] provider の parseAuthRequest() 自体は PKCE を強制しない
-    // （PKCE 素通り。経緯は docs/design-notes.md 参照）。MCP は S256 PKCE 付き
-    // authorization_code グラントを必須とするため、ここで明示的にアサートする。
-    if (oauthReqInfo.responseType !== "code") {
-      log("authorize_rejected", {
-        client_id: oauthReqInfo.clientId,
-        reason: `unsupported response_type: ${oauthReqInfo.responseType}`,
-      });
-      return c.text('不正な認可リクエストです: response_type は "code" である必要があります', 400);
-    }
+    // [13/PKCE] v0.10.2 の parseAuthRequest() は response_type と公開クライアントの
+    // PKCE 欠落を拒否するようになった。一方、機密クライアントの PKCE 省略は
+    // OAuth 2.1 上許容されるため通る。MCP は全クライアントに S256 PKCE を要求する
+    // ので、このアプリ固有の一段厳しい検問だけは残す。
     if (oauthReqInfo.codeChallengeMethod !== "S256" || !oauthReqInfo.codeChallenge) {
       log("authorize_rejected", {
         client_id: oauthReqInfo.clientId,
@@ -214,6 +220,14 @@ app.get("/authorize", async (c) => {
     });
   } catch (error) {
     if (error instanceof OAuthError) return error.toResponse();
+    if (error instanceof CimdFetchError) {
+      log("authorize_failed", {
+        reason: "cimd_fetch_failed",
+        cimd_url: error.metadataUrl,
+        detail: error.detail,
+      });
+      return c.text("クライアント情報の取得に失敗しました", 502);
+    }
     const reason = error instanceof Error ? error.message : String(error);
     log("authorize_failed", { reason });
     return c.text("サーバー内部エラーが発生しました", 500);

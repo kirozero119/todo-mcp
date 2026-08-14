@@ -47,7 +47,7 @@
   - [M-4] DCR 登録の有効期限を 7日 から 90日（provider 既定値）に戻した経緯
   - allowPlainPKCE を false にする理由
   - clientRegistrationCallback — DCR 登録時のログと redirect_uri ポリシー強制点
-  - [M-2/P1-3] 401 レスポンスへの scope 追記
+  - [13/M-2/P1-3] 401 scope の手書き追記を削除
   - Origin ガードの配置場所と production でのスコープ限定
 - [mcp.ts](#mcpts)
   - [scope enforcement] hasRequiredScope — 401 の scope 広告に対応する実体
@@ -196,7 +196,7 @@
 
 ### [scope enforcement] props.scopes とその強制ポイント
 
-**経緯**: `index.ts` の `onError()` は 401 レスポンスに必ず `scope="todo"` を付与している（RFC 6750 §3）が、これはあくまでクライアントへの案内であって、それだけではリソースサーバー側の強制にはならない。
+**経緯**: 401 レスポンスは `scope="todo"` を広告するが、これはあくまでクライアントへの案内であって、それだけではリソースサーバー側の強制にはならない。v0.8.3では `onError()` が手で追記し、v0.10.2では `resourceMetadata.scopes_supported` からprovider自身が生成する。
 
 **対応**: `/callback` 時に `resolveGrantedScopes()` で計算した実際の付与スコープを、grant の `scope` と props の `scopes` の両方に反映させる。`mcp.ts` の `mcpApiHandler` がリクエストごとに `props.scopes` を `SCOPES_SUPPORTED` と突き合わせてチェックする。これが 401 の `scope="todo"` 案内を裏付ける実際の強制ポイント。
 
@@ -308,11 +308,13 @@
 
 **ソース位置**: `github-handler.ts` の `registrationSource()`
 
-### PKCE 素通り（provider の仕様） — parseAuthRequest() 自体は PKCE を強制しない
+### [13] v0.10.2 後も全クライアント向け PKCE 検問を残す理由
 
-**問題**: workers-oauth-provider の `parseAuthRequest()` は、PKCE の強制や implicit フローの拒否を自分ではやらない。`code_challenge_method=S256` なのに `code_challenge` が欠けているリクエストもそのまま通してしまい、`completeAuthorization()` 側にも PKCE/implicit のガードは存在しない（`dist/oauth-provider.js` を確認して確定させた）。
+**v0.8.3 の問題**: `parseAuthRequest()` は PKCE の強制や implicit フローの拒否を自分では行わず、`code_challenge_method=S256` なのに `code_challenge` が欠けたリクエストも通していた。そのため response type と S256 PKCE をハンドラ側で二重検査していた。
 
-**対応**: MCP は S256 PKCE 付きの authorization_code グラントを必須としているため、`response_type !== "code"` と「S256 かつ空でない `code_challenge` が揃っているか」を、`parseAuthRequest()` の直後・他の処理に触れる前に、このハンドラ側で明示的にアサートする。
+**v0.10.2 の判定**: provider 自身が response type を検証し、公開クライアントの authorization code フローでは PKCE 欠落を拒否するようになった。一方、`token_endpoint_auth_method=client_secret_basic` の機密クライアントは PKCE 無しでも通る。これは OAuth 2.1 としては妥当だが、MCP クライアントは PKCE を実装する必要があるため Todo MCP のポリシーより広い。
+
+**対応**: response type の手書き検査は削除した。「S256 かつ空でない `code_challenge`」の検問だけは、機密クライアントを含む全クライアントに MCP の要求を適用するため残す。`oauth-grants.test.ts` で、公開クライアントは provider が拒否し、機密クライアントは provider を通る境界を実ライブラリで固定した。
 
 **ソース位置**: `github-handler.ts` の `GET /authorize` ハンドラ
 
@@ -355,6 +357,8 @@
 **対応（github-handler.ts /callback）**: `resource` が未指定なら、この呼び出し元リクエストの「裸のオリジン」（`new URL(...).origin`）を補って `completeAuthorization()` に渡す。既に `resource` を送ってきているクライアントの値は上書きしない。
 
 **波及（index.ts の OAuthProvider 設定 resourceMatchOriginOnly）**: 上記の補完は「裸のオリジン」形状の resource を grant に刻む。一方この設定を true にしないと、`/token` の `resourceMatches()` は完全一致を要求するため、後から律儀に `resource=<origin>/mcp`（このサーバーの実際の apiRoute と一致するフルの値）を送ってきたクライアントが、自分自身の grant に対して `invalid_target` エラーになってしまう。`resourceMatchOriginOnly: true` にして scheme+host+port だけの比較にすることで、この非対称性を解消する。
+
+**[13] v0.10.2 との関係**: `resourceMetadata.resource` を設定した場合は、その1つの canonical resource が認可・token・外部tokenの厳密なポリシーになり、`resourceMatchOriginOnly` でも緩和できない。Todo MCP は同じコードを localhost と本番originで動かすため、この静的値は設定していない。したがって新しい strict policy と補完は衝突せず、動的originを安全な audience にする既存補完は引き続き必要。実ライブラリで別resourceが `invalid_target` になるテストも追加した。
 
 **ソース位置**: `github-handler.ts` の `GET /callback` ハンドラ（audience 補完）、`index.ts` の `OAuthProvider` 設定（`resourceMatchOriginOnly`）
 
@@ -461,9 +465,9 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 
 ### allowPlainPKCE を false にする理由
 
-**問題**: workers-oauth-provider は既定で `allowPlainPKCE` が true になっており（`dist/oauth-provider.js` の該当分岐: `allowPlainPKCE !== false ? ["plain","S256"] : ["S256"]`）、`code_challenge_method` が省略された場合も "plain" として扱ってしまう。MCP は S256 の PKCE を必須としている。
+**問題**: workers-oauth-provider は v0.10.2 でも互換性のため `allowPlainPKCE` の既定が true。MCP は S256 の PKCE を必要とする。
 
-**対応**: `allowPlainPKCE: false` を明示することで、advertise するメソッドから `plain` を外すと同時に、PKCE 自体を必須にする。
+**対応**: `allowPlainPKCE: false` を明示し、advertise と受理対象から `plain` を外す。公開クライアントの PKCE 欠落は v0.10.2 が拒否する。機密クライアントを含む全クライアントへの必須化は `github-handler.ts` の検問が担当する。
 
 **ソース位置**: `index.ts` の `OAuthProvider` 設定（`allowPlainPKCE`）
 
@@ -475,13 +479,21 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 
 **ソース位置**: `index.ts` の `OAuthProvider` 設定（`clientRegistrationCallback`）
 
-### [M-2/P1-3] 401 レスポンスへの scope 追記
+### [13/M-2/P1-3] 401 scope の手書き追記を削除
 
 **問題**: 「未認証」と「認証はできているが todo スコープが足りない」を、クライアントが追加の往復なしに区別できるようにしたい。
 
-**対応**: RFC 6750 §3 に従い、リソースサーバーが 401 に必要な scope を advertise する。`onError()` で `status === 401 && code === "invalid_token"` のとき、既存の `WWW-Authenticate` ヘッダーの末尾に `scope="todo"` を追記して返す。
+**v0.8.3 の対応**: `onError()` で `invalid_token` 401 の `WWW-Authenticate` 末尾へ `scope="todo"` を追記していた。
 
-**ソース位置**: `index.ts` の `OAuthProvider` 設定（`onError`）
+**v0.10.2 の対応**: `resourceMetadata.scopes_supported` を明示すると provider 自身が challenge に scope を載せる。従来の hook を残すと同じscopeが二重になるため、レスポンス改変は削除した。`onError()` は監査ログだけを担当する。
+
+**ソース位置**: `index.ts` の `resourceMetadata` / `onError`
+
+### [13] resourceMetadata.scopes_supported を明示する
+
+**問題**: v0.8.3 は protected resource metadata の `scopes_supported` が無いと top-level の `scopesSupported` へフォールバックした。v0.10.2 は AS が発行できるスコープとリソースの基本要件を分離し、このフォールバックを廃止した。そのまま上げると初回401と RFC 9728 metadata から `todo` が消える。
+
+**対応**: `resourceMetadata.scopes_supported: [...SCOPES_SUPPORTED]` を明示した。top-level `scopesSupported` は AS metadata、resource metadata 側は基本機能に必要な最小スコープという役割分担になる。
 
 ### Origin ガードの配置場所と production でのスコープ限定
 
@@ -503,7 +515,7 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 
 ### [scope enforcement] hasRequiredScope — 401 の scope 広告に対応する実体
 
-**問題**: `index.ts` の `onError()` はすべての 401 で `scope="todo"` を advertise している（RFC 6750 §3）が、これまではリソースサーバー側でトークンの実際の付与スコープをチェックする箇所が存在しなかった。認証済みのトークンであれば、`/callback` 時に `resolveGrantedScopes()` が実際に何を許可したかに関わらず、どのツールにも到達できてしまっていた。
+**問題**: 401 は `scope="todo"` を advertise している（v0.10.2では `resourceMetadata.scopes_supported` が正本）が、これまではリソースサーバー側でトークンの実際の付与スコープをチェックする箇所が存在しなかった。認証済みのトークンであれば、`/callback` 時に `resolveGrantedScopes()` が実際に何を許可したかに関わらず、どのツールにも到達できてしまっていた。
 
 **対応**: `hasRequiredScope()` で `props.scopes` に `"todo"` が含まれるかを確認し、含まれなければ `mcpApiHandler` がツール呼び出しに到達する前に 403（`insufficient_scope`）を返す。401 の `scope="todo"` advertise が暗に約束していた強制ポイントを、実際に実装したもの。
 
@@ -580,7 +592,7 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 - ② MCP の Authorization 仕様は、401 を受けたクライアントは `WWW-Authenticate` の `resource_metadata`（RFC 9728）から認可サーバーを見つけて認可フローを開始する、としている。Claude Code の初回接続はまさにこの経路（トークン無し → provider の 401 → ブラウザが開く）で成立している。403 に対する既定の振る舞いは仕様に無く、単なる失敗として出る。
 - ③ 401 なら再認証がブラウザで走り、`GET /callback` の allowlist に当たって `access_denied` で返る。「もう許可されていない」が人間の目に見える形で出る。403 だと CLI 上の不透明なエラーで終わり、外された本人にも運用者にも理由が伝わらない。
 
-3軸とも 401 側なので 401 にした。ヘッダーは provider 自身の 401（`buildWwwAuthenticateHeader` / `handleApiRequest`）と同じ形に揃え、`resource_metadata` を必ず載せる。末尾に `scope="todo"` を足すのは index.ts の `onError()`（[M-2/P1-3]）と同じ理由・同じ形にするため。
+3軸とも 401 側なので 401 にした。ヘッダーは provider 自身の 401（`buildWwwAuthenticateHeader` / `handleApiRequest`）と同じ形に揃え、`resource_metadata` を必ず載せる。`scope="todo"` は v0.10.2 の `resourceMetadata.scopes_supported` から作られる provider 401 と同じ理由・同じ形にする。
 
 **この選択で受け入れたもの**: 外された人の端末は「ブラウザが開く → 拒否される」を繰り返す可能性がある。これは避けたいコストではなく③で欲しかったものそのもの（黙って失敗し続けるより、拒否が見えるほうがよい）。
 
@@ -665,7 +677,7 @@ grant も token も KV の expiration 付きで書かれるので、期限が来
 
 - 両方の応答に `NO_CACHE_HEADERS` を付けた。認証エラーは同じ URL への次のリクエストで結果が変わり得る（allowlist に書き戻した直後）ので、中間キャッシュに保持させない。
 - 正本がどれかをコメントで名指しした: `buildWwwAuthenticateHeader()`（ヘッダ本体）、`handleApiRequest()`（`resourceMetadataUrl` の組み立て）、`createErrorResponse()` + `NO_CACHE_HEADERS`（キャッシュ抑止と本文の形）。いずれも `@cloudflare/workers-oauth-provider` の `dist/oauth-provider.js`。
-- コメントだけでは気付けないので、`test/provider-response-shape.test.ts` が**実ライブラリ**を動かして突き合わせる。`OAuthProvider` に Authorization ヘッダ無しの `/mcp` リクエストを渡すと `handleApiRequest()` の 401 が出るので、その `WWW-Authenticate` のうち `error_description` の手前まで（スキーム・realm・`resource_metadata`・エラーコード）をこちらの 401 が前方一致で再現していること、no-cache ヘッダが一致すること、本文が同じ 2 フィールドであることを見る。設計上の差分（`error_description` の中身と末尾の `scope=`）はテストに明示してあるので、drift と区別できる。
+- コメントだけでは気付けないので、`test/provider-response-shape.test.ts` が**実ライブラリ**を動かして突き合わせる。v0.10.2 では Authorization ヘッダ無しの401は本文も `error` も持たない素の discovery challenge になったため、比較対象を不正なBearer tokenの `invalid_token` 401へ変更した。手書き401の `WWW-Authenticate`（realm / `resource_metadata` / error / scope）は実ライブラリと完全一致し、本文は同じ2フィールド構造、no-cacheヘッダも一致することを見る。ヘッダーの `error_description` は provider が出さなくなったため手書き側からも削除した。
 
 `test/oauth-grants.test.ts` と同じ狙い —— **ライブラリを上げるチケット 13 で効くテスト**。実 dist を node プールで動かすのに要る 2 点（`cloudflare:workers` の仮想モジュール差し替えと `server.deps.inline`）は vitest.config.ts に理由つきで書いてある。
 

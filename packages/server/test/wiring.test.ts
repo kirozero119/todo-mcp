@@ -122,4 +122,27 @@ describe("index.ts wiring [15]", () => {
       expect(response.status, `${route} refused a listed identity`).toBe(200);
     }
   });
+
+  it("[13] advertises the resource scope once and leaves provider errors unmodified", async () => {
+    const options = await providerOptions();
+    const resourceMetadata = options.resourceMetadata as { scopes_supported?: string[] };
+    expect(resourceMetadata.scopes_supported).toEqual(["todo"]);
+
+    const onError = options.onError as (error: {
+      code: string;
+      description: string;
+      status: number;
+      headers: Record<string, string>;
+    }) => Response | undefined;
+    const response = onError({
+      code: "invalid_token",
+      description: "Invalid access token",
+      status: 401,
+      headers: {
+        "WWW-Authenticate": 'Bearer error="invalid_token", scope="todo"',
+      },
+    });
+
+    expect(response).toBeUndefined();
+  });
 });

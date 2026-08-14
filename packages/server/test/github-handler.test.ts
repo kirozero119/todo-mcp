@@ -1,3 +1,4 @@
+import { CimdFetchError } from "@cloudflare/workers-oauth-provider";
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -28,6 +29,7 @@ function kvStub(): KVNamespace {
 
 function oauthProviderStub(overrides: {
   parseAuthRequest?: (request: Request) => Promise<AuthRequest>;
+  lookupClient?: OAuthHelpers["lookupClient"];
   completeAuthorization?: OAuthHelpers["completeAuthorization"];
 } = {}): OAuthHelpers {
   return {
@@ -36,7 +38,7 @@ function oauthProviderStub(overrides: {
       (async () => {
         throw new Error("parseAuthRequest not stubbed for this test");
       }),
-    lookupClient: async () => null,
+    lookupClient: overrides.lookupClient ?? (async () => null),
     completeAuthorization:
       overrides.completeAuthorization ??
       (async () => ({ redirectTo: "https://client.example/unused" })),
@@ -133,7 +135,7 @@ describe("GET /authorize", () => {
     expect(cookies.some((c) => c.startsWith("__Host-CONSENTED_STATE="))).toBe(false);
   });
 
-  it("[M-1/P1-1] rejects code_challenge_method=S256 without a code_challenge", async () => {
+  it("[13] keeps the all-client PKCE guard after the provider accepts a confidential client", async () => {
     const env = makeEnv({
       provider: oauthProviderStub({
         parseAuthRequest: async () => ({ ...BASE_AUTH_REQUEST, codeChallenge: undefined }),
@@ -146,17 +148,51 @@ describe("GET /authorize", () => {
     expect(response.status).toBe(400);
   });
 
-  it("[M-1/P1-1] rejects response_type=token", async () => {
+  it("[13] does not expose a CIMD fetch failure detail from parseAuthRequest", async () => {
+    const failure = new CimdFetchError(
+      "https://cimd.example/client-metadata.json",
+      new Error("private upstream detail"),
+    );
     const env = makeEnv({
       provider: oauthProviderStub({
-        parseAuthRequest: async () => ({ ...BASE_AUTH_REQUEST, responseType: "token" }),
+        parseAuthRequest: async () => {
+          throw failure;
+        },
       }),
     });
-    const request = new Request("http://localhost:8788/authorize?response_type=token");
+    const request = new Request("http://localhost:8788/authorize");
 
     const response = await GitHubHandler.fetch(request, env, ctxStub);
 
     expect(response.status).toBe(400);
+    expect(await response.text()).toBe("不正な認可リクエストです: クライアント情報を取得できません");
+  });
+
+  it("[13] fails closed when the second CIMD lookup throws", async () => {
+    const failure = new CimdFetchError(
+      "https://cimd.example/client-metadata.json",
+      new Error("private upstream detail"),
+    );
+    const env = makeEnv({
+      provider: oauthProviderStub({
+        parseAuthRequest: async () => ({
+          ...BASE_AUTH_REQUEST,
+          clientId: "https://cimd.example/client-metadata.json",
+        }),
+        lookupClient: async () => {
+          throw failure;
+        },
+      }),
+    });
+
+    const response = await GitHubHandler.fetch(
+      new Request("http://localhost:8788/authorize"),
+      env,
+      ctxStub,
+    );
+
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("クライアント情報の取得に失敗しました");
   });
 
   it("[H-1] still shows the dialog for an approved client when the redirect_uri is a loopback address", async () => {

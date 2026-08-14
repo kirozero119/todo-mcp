@@ -17,7 +17,7 @@ import type {
   OAuthHelpers,
   OAuthProviderOptions,
 } from "@cloudflare/workers-oauth-provider";
-import { getOAuthApi } from "@cloudflare/workers-oauth-provider";
+import { CimdFetchError, getOAuthApi } from "@cloudflare/workers-oauth-provider";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { approveOAuthState, bindStateToSession, createOAuthState } from "../src/approval";
@@ -101,7 +101,10 @@ function providerOptions(): OAuthProviderOptions<{ OAUTH_KV: KVNamespace }> {
     allowPlainPKCE: false,
     scopesSupported: [...SCOPES_SUPPORTED],
     resourceMatchOriginOnly: true,
-    resourceMetadata: { resource_name: SERVER_NAME },
+    resourceMetadata: {
+      resource_name: SERVER_NAME,
+      scopes_supported: [...SCOPES_SUPPORTED],
+    },
   } as OAuthProviderOptions<{ OAUTH_KV: KVNamespace }>;
 }
 
@@ -308,5 +311,82 @@ describe("[09/複数端末] 実ライブラリに対する grant の共存", () 
 
       expect(store.grantKeys()).toHaveLength(1);
     });
+  });
+});
+
+describe("[13] workers-oauth-provider v0.10.2 の境界契約", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function authorizationRequestUrl(clientId: string, withPkce = false, resource?: string): string {
+    const url = new URL("http://localhost:8788/authorize");
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("client_id", clientId);
+    url.searchParams.set("redirect_uri", LOOPBACK_REDIRECT_URI);
+    if (withPkce) {
+      url.searchParams.set("code_challenge", "c".repeat(43));
+      url.searchParams.set("code_challenge_method", "S256");
+    }
+    if (resource) url.searchParams.set("resource", resource);
+    return url.href;
+  }
+
+  it("公開クライアントの PKCE 省略を provider 自身が拒否する", async () => {
+    const store = kvStub();
+    const provider = realProvider(store.kv);
+    const clientId = await registerDcrClient(provider);
+
+    await expect(provider.parseAuthRequest(new Request(authorizationRequestUrl(clientId)))).rejects
+      .toThrow("Public clients must use PKCE");
+  });
+
+  it("機密クライアントの PKCE 省略は provider を通るためアプリ側検問が必要", async () => {
+    const store = kvStub();
+    const provider = realProvider(store.kv);
+    const client = await provider.createClient({
+      redirectUris: [LOOPBACK_REDIRECT_URI],
+      clientName: "confidential-client",
+      tokenEndpointAuthMethod: "client_secret_basic",
+    });
+
+    const parsed = await provider.parseAuthRequest(
+      new Request(authorizationRequestUrl(client.clientId)),
+    );
+    expect(parsed.codeChallenge).toBeUndefined();
+    expect(parsed.codeChallengeMethod).toBeUndefined();
+  });
+
+  it("resourceMetadata.resource 設定時は別 resource を厳密に拒否する", async () => {
+    const store = kvStub();
+    const provider = getOAuthApi(
+      {
+        ...providerOptions(),
+        resourceMetadata: {
+          resource: "https://todo.example/mcp",
+          resource_name: SERVER_NAME,
+          scopes_supported: [...SCOPES_SUPPORTED],
+        },
+      },
+      { OAUTH_KV: store.kv },
+    );
+    const clientId = await registerDcrClient(provider);
+
+    await expect(
+      provider.parseAuthRequest(
+        new Request(authorizationRequestUrl(clientId, true, "https://other.example/mcp")),
+      ),
+    ).rejects.toThrow("must exactly match https://todo.example/mcp");
+  });
+
+  it("CIMD 解決失敗は null ではなく CimdFetchError になる", async () => {
+    stubCompatibilityFlags();
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new Error("upstream unavailable");
+    }));
+    const store = kvStub();
+    const provider = realProvider(store.kv);
+
+    await expect(provider.lookupClient(CIMD_CLIENT_ID)).rejects.toBeInstanceOf(CimdFetchError);
   });
 });

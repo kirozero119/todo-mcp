@@ -34,7 +34,7 @@ function ctxStub(props: Record<string, unknown>): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
-function mcpRequest(): Request {
+function mcpRequest(authorization?: string): Request {
   return new Request(MCP_URL, {
     method: "POST",
     headers: {
@@ -42,14 +42,15 @@ function mcpRequest(): Request {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
       "MCP-Protocol-Version": "2025-06-18",
+      ...(authorization ? { Authorization: authorization } : {}),
     },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
   });
 }
 
 /**
- * The provider's own 401 for `/mcp`, taken from the no-Authorization-header
- * path in `handleApiRequest()`. Deliberately built *without* index.ts's
+ * The provider's own `invalid_token` 401 for `/mcp`. Deliberately built
+ * *without* index.ts's
  * `onError()` hook so this is the library's unmodified shape.
  */
 async function providerOwn401(): Promise<Response> {
@@ -61,14 +62,21 @@ async function providerOwn401(): Promise<Response> {
     authorizeEndpoint: "/authorize",
     tokenEndpoint: "/token",
     scopesSupported: [...SCOPES_SUPPORTED],
-    resourceMetadata: { resource_name: SERVER_NAME },
+    resourceMetadata: {
+      resource_name: SERVER_NAME,
+      scopes_supported: [...SCOPES_SUPPORTED],
+    },
   } as unknown as OAuthProviderOptions);
 
   const response = await (
     provider as unknown as {
       fetch: (r: Request, e: unknown, c: ExecutionContext) => Promise<Response>;
     }
-  ).fetch(mcpRequest(), { OAUTH_KV: {} }, ctxStub({}));
+  ).fetch(
+    mcpRequest("Bearer not-a-valid-token"),
+    { OAUTH_KV: { get: async () => null } },
+    ctxStub({}),
+  );
   expect(response.status).toBe(401);
   return response;
 }
@@ -96,20 +104,10 @@ describe("[provider response shape] our refusals still match the library's", () 
     const providerHeader = (await providerOwn401()).headers.get("WWW-Authenticate") ?? "";
     const ourHeader = (await ourIdentityNotAllowed401()).headers.get("WWW-Authenticate") ?? "";
 
-    // Everything up to `error_description` is common ground: the scheme, the
-    // realm, the RFC 9728 `resource_metadata` pointer (including how the URL is
-    // derived from the request) and the error code. Only the description and
-    // our trailing `scope=` differ, by design.
-    const marker = ', error_description="';
-    expect(providerHeader).toContain(marker);
-    const commonPrefix = providerHeader.slice(0, providerHeader.indexOf(marker) + marker.length);
-    expect(commonPrefix).toContain('resource_metadata="');
-    expect(ourHeader.startsWith(commonPrefix)).toBe(true);
-
-    // The two by-design differences, stated so a future reader can tell them
-    // apart from drift.
-    expect(ourHeader).toContain('error_description="This GitHub identity is no longer allowed');
-    expect(ourHeader.endsWith(`scope="${SCOPES_SUPPORTED.join(" ")}"`)).toBe(true);
+    expect(providerHeader).toContain('resource_metadata="');
+    expect(providerHeader).toContain('error="invalid_token"');
+    expect(providerHeader).toContain(`scope="${SCOPES_SUPPORTED.join(" ")}"`);
+    expect(ourHeader).toBe(providerHeader);
   });
 
   it("both of our refusals carry the same no-cache headers the provider sets", async () => {

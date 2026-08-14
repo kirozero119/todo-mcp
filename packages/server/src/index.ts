@@ -44,7 +44,9 @@ const provider = new OAuthProvider<Env>({
   clientRegistrationTTL: 60 * 60 * 24 * 90,
 
   // MCP は S256 PKCE を必須とする。provider の既定は allowPlainPKCE: true
-  // なので、明示的に false にして plain を排除し PKCE を必須化する。
+  // なので、明示的に false にして plain を排除する。v0.10.2 は公開クライアントの
+  // PKCE 欠落も拒否するが、機密クライアントを含む全クライアントへの強制は
+  // github-handler.ts 側の検問を残す。
   allowPlainPKCE: false,
 
   // ASが発行しうる権限の種類
@@ -56,7 +58,12 @@ const provider = new OAuthProvider<Env>({
 
   // `resource` と `authorization_servers` は provider に任せる（リクエスト
   // URL から導出させる）。固定するとローカル/本番のどちらかが壊れる。
-  resourceMetadata: { resource_name: SERVER_NAME },
+  // v0.10.2 で scopesSupported からのフォールバックが廃止されたため、リソースが
+  // 要求する最小スコープは RFC 9728 metadata 側にも明示する。
+  resourceMetadata: {
+    resource_name: SERVER_NAME,
+    scopes_supported: [...SCOPES_SUPPORTED],
+  },
 
   // すべての DCR 登録をログに残す。何も返さなければ登録は許可される。
   //
@@ -89,24 +96,11 @@ const provider = new OAuthProvider<Env>({
     }
   },
 
-  onError: ({ code, description, status, headers }) => {
+  onError: ({ code, description, status }) => {
     console.log(`[oauth] ${JSON.stringify({ event: "error", code, status, description })}`);
-
-    // [M-2/P1-3] RFC 6750 §3: 401 に必要な scope を追記する。経緯は
-    // docs/design-notes.md 参照。
-    if (status === 401 && code === "invalid_token") {
-      const wwwAuthenticate = headers["WWW-Authenticate"];
-      if (wwwAuthenticate) {
-        return new Response(JSON.stringify({ error: code, error_description: description }), {
-          status,
-          headers: {
-            "Content-Type": "application/json",
-            ...headers,
-            "WWW-Authenticate": `${wwwAuthenticate}, scope="${SCOPES_SUPPORTED.join(" ")}"`,
-          },
-        });
-      }
-    }
+    // v0.10.2 は resourceMetadata.scopes_supported から challenge の scope を
+    // 自身で組み立てる。ここで追記すると scope が重複するため、hook は監査ログ
+    // だけを担当する。
     return undefined;
   },
 });

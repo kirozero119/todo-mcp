@@ -240,11 +240,11 @@ function allowlistDenialReason(
  * 再認証は `GET /callback` の allowlist に当たって `access_denied` になるので、
  * 「もう許可されていない」がブラウザ上で人間に見える。**401 を受けた実際の
  * クライアントが何をするかはクライアント側の実装**で、ここからは強制できない
- * （未検証。docs/design-notes.md の [15] 判断1）。`scope=` を足すのは index.ts の
- * `onError()`（[M-2/P1-3]）と同じ理由・同じ形にするため。
+ * （未検証。docs/design-notes.md の [15] 判断1）。`scope=` は v0.10.2 の
+ * `resourceMetadata.scopes_supported` から作られる provider 401 と同じ形にする。
  *
  * [provider response shape] `WWW-Authenticate` の正本は provider の
- * `buildWwwAuthenticateHeader(resourceMetadataUrl, error, errorDescription)`、
+ * `buildWwwAuthenticateHeader(resourceMetadataUrl, error)`、
  * `resourceMetadataUrl` の組み立てと `NO_CACHE_HEADERS` の正本は
  * `handleApiRequest()` / `createErrorResponse()`（いずれも
  * @cloudflare/workers-oauth-provider の dist/oauth-provider.js）。ここは
@@ -260,7 +260,6 @@ function allowlistDenialReason(
 function identityNotAllowedResponse(request: Request): Response {
   const url = new URL(request.url);
   const resourceMetadataUrl = `${url.origin}/.well-known/oauth-protected-resource${url.pathname}`;
-  // `"` を含めない（WWW-Authenticate の quoted-string を壊さないため）。
   const description = "This GitHub identity is no longer allowed to use this server";
   return new Response(JSON.stringify({ error: "invalid_token", error_description: description }), {
     status: 401,
@@ -269,8 +268,7 @@ function identityNotAllowedResponse(request: Request): Response {
       ...NO_CACHE_HEADERS,
       "WWW-Authenticate":
         `Bearer realm="OAuth", resource_metadata="${resourceMetadataUrl}", ` +
-        `error="invalid_token", error_description="${description}", ` +
-        `scope="${SCOPES_SUPPORTED.join(" ")}"`,
+        `error="invalid_token", scope="${SCOPES_SUPPORTED.join(" ")}"`,
     },
   });
 }
