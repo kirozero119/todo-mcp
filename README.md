@@ -88,7 +88,9 @@ Node 22.18 以降でリポジトリを clone し、依存を入れて `todo` を
 
 ```bash
 npm install
-npm link --workspace @todo-mcp/cli
+cd packages/cli
+npm link
+cd ../..
 ```
 
 各端末に次の 4 変数を設定する。DB URL / token は Workers の本番設定と同じ Turso DB を向ける。
