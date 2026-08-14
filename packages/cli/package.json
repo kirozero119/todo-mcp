@@ -1,0 +1,25 @@
+{
+  "name": "@todo-mcp/cli",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Turso 上の Todo を人間が端末から直接扱う CLI",
+  "type": "module",
+  "bin": {
+    "todo": "./src/main.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@todo-mcp/core": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}
