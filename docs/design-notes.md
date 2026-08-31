@@ -302,6 +302,20 @@
 
 **ソース位置**: `github-handler.ts` の `respondAccessDenied()`（呼び出し元は同ファイル内の `respondAccessDenied(` 検索で列挙する）
 
+### [08/リーディング] /callback の 502 を server_error の 302 にはしない（検討済み・見送り）
+
+**問い**: `GET /callback` で GitHub とのコード交換・身元取得に失敗したとき、現状は 502 のエラーページで終わる。この時点で redirect_uri は検証済みなので、RFC 6749 §4.1.2.1 の `error=server_error` を 302 で返すこともできる（「失敗の返し方は redirect_uri を信用できるかで二分」の原則では、信用できる側にいる）。返すべきか — コードリーディング（wayfinder 08、02 章 2-8）で発見された未決の問い。
+
+**見送りの理由**（2026-08-31、開発完遂判断の一環として記録）:
+
+1. 発生条件が「GitHub 側の障害・失敗がコールバックの瞬間に重なる」場合に限られ、影響も 1 回の認可のやり直しに留まる
+2. 現挙動でも人間には 502 が見え、ログには切り分け可能な reason が残る（[L-14] の単一 catch と外部呼び出しの reason ログ）
+3. 実装すると認可経路の変更 + テスト + 本番デプロイ + 3 台再確認のコストが掛かり、頻度・影響と釣り合わない
+
+**再燃条件**: クライアント（Claude Code 等）がこの経路で待ち続けて実害が出た場合、または OSS 利用者からの報告があった場合。実装するなら `respondAccessDenied()` と同型のヘルパで `error=server_error`（+ あれば `state`、`iss`）を返す形。
+
+**ソース位置**: `github-handler.ts` の `GET /callback`（コード交換失敗・身元取得失敗の 502 を返す 2 箇所）
+
 ### [Codex / RFC 9207] 認可レスポンスの issuer をコールバック origin から固定する
 
 **問題**: Codex CLI は認可サーバーメタデータの `authorization_response_iss_parameter_supported: true` に従い、ループバック callback に戻る成功・拒否レスポンスの `iss` を検証する。`workers-oauth-provider` の `completeAuthorization()` は `request.issuer` が無ければ `iss` を省略するため、永続化した認可リクエストの形や拒否経路によっては Codex が `Authorization server response missing required issuer` で停止する。
