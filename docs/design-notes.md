@@ -296,11 +296,11 @@
 
 ### [L-13] 認可拒否レスポンスの共通化（respondAccessDenied）
 
-**問題**: 「認可が拒否されて grant が一切作られずに終わる」経路が2つある。①このサーバー自身の allowlist が GitHub アイデンティティを拒否する場合、②GitHub 自体が upstream の認可を拒否する場合（ユーザーが GitHub 側の同意画面で Cancel を押した、GitHub App が suspend されている等）。どちらも素の 403 やエラーステータスをクライアントに返すと、クライアント側に解釈する標準的な手段がない。
+**問題**: 「認可が拒否されて grant が一切作られずに終わる」経路が複数ある（このサーバーの同意ダイアログでの利用者拒否、このサーバー自身の allowlist による拒否、GitHub 自体が upstream の認可を拒否する場合 — ユーザーが GitHub 側の同意画面で Cancel を押した、GitHub App が suspend されている等）。どれも素の 403 やエラーステータスをクライアントに返すと、クライアント側に解釈する標準的な手段がない。
 
-**対応**: 両方の経路を `respondAccessDenied()` に共通化し、RFC 6749 §4.1.2.1 に従って、クライアントの検証済み redirect_uri へ `error=access_denied`（と、あれば元の `state`）を付けてリダイレクトで返す。RFC 9207 の `iss` も認可サーバー自身の origin から導出して付ける。
+**対応**: これらの経路を `respondAccessDenied()` に共通化し、RFC 6749 §4.1.2.1 に従って、クライアントの検証済み redirect_uri へ `error=access_denied`（と、あれば元の `state`）を付けてリダイレクトで返す。RFC 9207 の `iss` も認可サーバー自身の origin から導出して付ける。クライアントへは同じ `access_denied` に畳む一方、ログは `authorize_user_denied` / `callback_upstream_denied` / `callback_denied` と経路別に分ける（情報の粒度は「誰に読ませるか」で決める。クライアントの取るべき行動はどれも同じ、運用者は原因の切り分けが要る）。経路の個数はコメントに書かない — 個数を書いたコメントは経路の追加で腐ることを、実際にこのコメント自身で確認した（当初「2つの経路」と書かれ、同意ダイアログ拒否の追加に追従できていなかった）。
 
-**ソース位置**: `github-handler.ts` の `respondAccessDenied()`（呼び出し元: `GET /callback` の allowlist 拒否と GitHub-side denial）
+**ソース位置**: `github-handler.ts` の `respondAccessDenied()`（呼び出し元は同ファイル内の `respondAccessDenied(` 検索で列挙する）
 
 ### [Codex / RFC 9207] 認可レスポンスの issuer をコールバック origin から固定する
 

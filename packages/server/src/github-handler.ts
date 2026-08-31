@@ -81,9 +81,9 @@ function redirectToGitHub(
 }
 
 /**
- * [L-13] grant を作らずに拒否で終わる2つの経路（allowlist 拒否 / GitHub 自身の
- * 拒否）で共有する。RFC 6749 §4.1.2.1 に従い、クライアントの検証済み
- * redirect_uri へリダイレクトで返す。詳細は docs/design-notes.md 参照。
+ * [L-13] grant を作らずに拒否で終わる経路すべてで共有する。RFC 6749 §4.1.2.1
+ * に従い、クライアントの検証済み redirect_uri へリダイレクトで返す。
+ * 詳細は docs/design-notes.md 参照。
  */
 function respondAccessDenied(
   oauthReqInfo: AuthRequest,
